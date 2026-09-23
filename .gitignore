@@ -1,0 +1,45 @@
+# Build outputs
+build/
+build-*/
+out/
+bin/
+lib/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake
+!cmake/*.cmake.in
+CMakeUserPresets.json
+
+# Visual Studio / MSBuild
+.vs/
+*.sln
+*.vcxproj*
+*.dir/
+*.suo
+*.user
+*.ncb
+*.tlog
+
+# Binary artifacts
+*.obj
+*.lib
+*.dll
+*.exe
+*.pdb
+*.exp
+*.ilk
+*.idb
+
+# Dependencies fetched locally
+_deps/
+
+# Logs and environment
+*.log
+.env
+.env.*
