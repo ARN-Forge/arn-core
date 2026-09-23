@@ -113,44 +113,47 @@ if (MSVC)
     target_compile_options(arn_core PRIVATE /utf-8)
 endif()
 
-# Installation and packaging
-install(TARGETS arn_core
-    EXPORT arn_coreTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+# Installation and packaging (only when built as top-level project)
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    install(TARGETS arn_core
+        EXPORT arn_coreTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
-install(DIRECTORY include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
-install(EXPORT arn_coreTargets
-    FILE arn_coreTargets.cmake
-    NAMESPACE arn::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/arn_core
-)
+    install(EXPORT arn_coreTargets
+        FILE arn_coreTargets.cmake
+        NAMESPACE arn::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/arn_core
+    )
 
-set(ARN_CORE_CONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/arn_core")
+    set(ARN_CORE_CONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/arn_core")
 
-configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/arn_coreConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfig.cmake
-    INSTALL_DESTINATION ${ARN_CORE_CONFIG_INSTALL_DIR}
-)
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/arn_coreConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfig.cmake
+        INSTALL_DESTINATION ${ARN_CORE_CONFIG_INSTALL_DIR}
+    )
 
-write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfigVersion.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMinorVersion
-)
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion
+    )
 
-install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfig.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfigVersion.cmake
-    DESTINATION ${ARN_CORE_CONFIG_INSTALL_DIR}
-)
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/arn_coreConfigVersion.cmake
+        DESTINATION ${ARN_CORE_CONFIG_INSTALL_DIR}
+    )
+endif()
+
 
 # Tests
 if (BUILD_TESTING)
