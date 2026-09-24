@@ -2,25 +2,42 @@
 
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests: 6/6 Passing](https://img.shields.io/badge/Tests-6%2F6%20Passing-brightgreen.svg)]()
 
-**ARN Core** is a reusable, headless, modern C++23 framework for building autonomous AI agents and interactive LLM applications.
+**ARN Core** is a reusable, headless, modern C++23 orchestration framework for building autonomous AI agents and interactive LLM applications.
 
 ---
 
 ## What ARN Core Is
 
 ARN Core provides the foundational orchestration engine for AI agent workflows:
-- A clean, provider-agnostic agent orchestration layer (`AgentSession`).
-- Pluggable model providers implementing a unified interface (`IModelProvider`).
-- Generic tool registration, reflection, and invocation (`ToolRegistry`, `ITool`).
-- Human-in-the-loop confirmation primitives (`ConfirmationGate`, `ConfirmationRequest`).
-- Resilient streaming HTTP networking with Server-Sent Events (SSE) decoding and retry logic.
+- **Clean Agent Orchestration**: High-level multi-turn session coordinator (`AgentSession`).
+- **Pluggable Model Providers**: Unified provider abstraction (`IModelProvider`) with built-in integrations for **Google Gemini**, **DeepSeek**, and **OpenRouter**.
+- **Schema-Driven Tools**: Type-safe tool definition using JSON Schema, tool discovery, and dynamic invocation (`ToolRegistry`, `ITool`).
+- **Human-in-the-Loop Approvals**: Primitives for synchronous and asynchronous user confirmation gates (`ConfirmationGate`, `ConfirmationRequest`).
+- **Resilient Networking**: Server-Sent Events (SSE) streaming with exponential backoff, rate-limit handling, duplicate replay prevention, and non-blocking cooperative cancellation.
 
 ## What ARN Core Is NOT
 
-- **Not an agent application CLI**: ARN Core contains no terminal interface, REPL, or Protocol 2 server.
-- **Not a coding prompt or coding assistant**: ARN Core contains no built-in system prompt, no coding persona, and no coding-specific logic.
-- **Not a filesystem sandbox**: ARN Core does not sandbox file access or provide file execution restrictions. Application consumers are responsible for defining their own tools and security enforcement.
+- **Not an agent CLI**: ARN Core contains no terminal interface, REPL, or Protocol 2 server.
+- **Not a coding prompt or coding assistant**: ARN Core contains no hardcoded persona or coding-specific prompt templates.
+- **Not a filesystem sandbox**: ARN Core does not restrict OS commands or sandbox file paths. Host applications implement domain-specific tools and enforce security boundaries.
+
+---
+
+## Documentation Index
+
+Comprehensive developer guides are available in the [`docs/`](docs/) directory:
+
+- [**Getting Started**](docs/getting-started.md) — Prerequisites, build integration, and your first streaming agent.
+- [**Architecture Overview**](docs/architecture.md) — Subsystems, data flow, concurrency model, and security boundaries.
+- [**AgentSession Guide**](docs/agent-session.md) — Session configuration, model selection, multi-turn history, and cancellation.
+- [**Model Providers**](docs/providers.md) — Google Gemini, DeepSeek, OpenRouter, capability detection, and wire formats.
+- [**Tool System**](docs/tools.md) — `ITool` interface, JSON Schema design, error containment, and `ToolRegistry`.
+- [**Human-in-the-Loop Confirmations**](docs/confirmations.md) — `ConfirmationRequest`, CLI prompts, and asynchronous `ConfirmationGate`.
+- [**Streaming & Cancellation**](docs/streaming-and-cancellation.md) — Token streaming via `SseDecoder`, network retries, and non-blocking aborts.
+- [**Writing a Custom Tool**](docs/custom-tool.md) — Step-by-step tutorial for domain-specific tools.
+- [**Writing a Custom Provider**](docs/custom-provider.md) — Step-by-step guide for local runtimes (Ollama, llama.cpp, vLLM).
 
 ---
 
@@ -30,36 +47,20 @@ ARN Core provides the foundational orchestration engine for AI agent workflows:
 AgentSession
     │
     ├── IModelProvider
-    │    ├── GeminiProvider
-    │    ├── DeepSeekProvider
-    │    └── OpenRouterProvider
+    │    ├── GeminiProvider (v1beta REST / SSE)
+    │    ├── DeepSeekProvider (OpenAI-compatible / SSE)
+    │    └── OpenRouterProvider (Unified multi-model gateway)
     │
     ├── ToolRegistry
-    │    └── ITool (user-defined tools)
+    │    └── ITool (user-defined tools with JSON Schema)
     │
     └── ConfirmationGate / ConfirmationHandler
+         └── ConfirmationRequest (Human-in-the-loop approvals)
 ```
 
 ---
 
-## Features
-
-- **Modern C++23**: Concepts, designated initializers, `std::string_view`, standard library conveniences.
-- **Provider-Independent Orchestration**: `AgentSession` manages multi-turn conversation history, executes tool loops, and streams tokens regardless of the backend provider.
-- **Supported Providers**:
-  - **Google Gemini** (`gemini-2.0-flash`, `gemini-1.5-pro`, etc.)
-  - **DeepSeek** (`deepseek-chat`, `deepseek-reasoner`)
-  - **OpenRouter** (unified gateway to Claude, Llama, Mistral, and more)
-- **Streaming & Cancellation**: Real-time SSE token delivery with cooperative thread-safe cancellation via `std::atomic<bool>`.
-- **Tool Calling**: Strict JSON Schema parameter definitions with automatic tool call extraction and dispatch.
-- **Confirmation Abstraction**: Thread-safe human-in-the-loop approvals for dangerous or state-altering actions.
-- **Resilient Networking**: Built-in exponential backoff, rate limit handling, and HTTP error classification.
-
----
-
-## Basic Usage
-
-Here is a minimal example using `arn::core`:
+## Quick Example
 
 ```cpp
 #include <iostream>
@@ -92,8 +93,8 @@ int main() {
         std::cout << delta << std::flush;
     });
 
-    if (!result.success) {
-        std::cerr << "\nError: " << result.error_message << '\n';
+    if (!result.ok) {
+        std::cerr << "\nError: " << result.message << '\n';
         return 1;
     }
 
@@ -102,16 +103,18 @@ int main() {
 }
 ```
 
+A complete, runnable example with tool execution and confirmation handling is available under [`examples/basic_agent/`](examples/basic_agent/).
+
 ---
 
 ## CMake Integration
 
-### Method 1: Installed Package (`find_package`)
+### Method 1: Installed Package (`find_package`) — Recommended
 
-Install `arn_core` to your system or a local prefix:
+Install `arn_core` to your system or local prefix:
 
 ```bash
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/path/to/install
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/path/to/install
 cmake --build build --config Release
 cmake --install build --config Release
 ```
@@ -119,6 +122,12 @@ cmake --install build --config Release
 In your consumer `CMakeLists.txt`:
 
 ```cmake
+cmake_minimum_required(VERSION 3.20)
+project(my_agent LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 find_package(arn_core 0.1.0 CONFIG REQUIRED)
 
 add_executable(my_agent main.cpp)
@@ -132,7 +141,7 @@ include(FetchContent)
 
 FetchContent_Declare(
     arn_core
-    GIT_REPOSITORY https://github.com/arnecto/arn-core.git
+    GIT_REPOSITORY https://github.com/ARN-Forge/arn-core.git
     GIT_TAG v0.1.0
     GIT_SHALLOW TRUE
 )
@@ -162,7 +171,7 @@ target_link_libraries(my_agent PRIVATE arn::core)
   - GCC 13+
   - Clang 17+
 - CMake 3.20 or newer
-- OpenSSL (required for HTTPS / SSL communication)
+- OpenSSL (required for HTTPS / TLS communication)
 
 ### Windows (MSVC)
 
@@ -180,13 +189,11 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-All unit tests run offline using local loopback HTTP mock servers and dummy providers. No real API keys or network calls are required to run tests.
+All 6 unit tests run 100% offline using local loopback HTTP mock servers and dummy providers. No external network access or API keys are required.
 
 ---
 
 ## Security Model & Boundary
-
-It is vital to understand the boundary between **ARN Core** and **Applications**:
 
 | Concern | ARN Core (`arn::core`) | Application Layer (e.g. ARN CLI) |
 |---|---|---|
@@ -200,11 +207,11 @@ It is vital to understand the boundary between **ARN Core** and **Applications**
 
 ---
 
-## Relationship to ARN
+## Relationship to the ARN Ecosystem
 
-ARN Core was originally developed as the foundation for **ARN** (`arnecto/arn`), an autonomous coding assistant for the terminal. During Phase 1–6 architectural refactoring, the agent orchestration engine, provider integrations, and tool abstractions were completely decoupled into this standalone repository.
+ARN Core was originally developed as the orchestration engine for **[ARN Code](https://github.com/ARN-Forge/ARN-Code)**, an autonomous terminal coding assistant. During architectural refactoring, the agent orchestration engine, provider integrations, and tool abstractions were completely decoupled into this standalone repository.
 
-ARN is now a consumer of ARN Core. Future applications (such as ARNday or custom domain agents) can consume `arn::core` without depending on ARN's CLI or coding prompt.
+ARN Code is now a consumer of ARN Core. Future applications (desktop assistants, domain agents, server daemons) can consume `arn::core` directly.
 
 ---
 

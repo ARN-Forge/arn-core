@@ -1,3 +1,8 @@
+/**
+ * @file openrouter_provider.hpp
+ * @brief OpenRouter multi-model gateway provider implementation.
+ */
+
 #pragma once
 
 #include <atomic>
@@ -16,16 +21,40 @@ class Client;
 
 namespace arn::core {
 
+/**
+ * @brief Configuration parameters for OpenRouter API requests.
+ */
 struct OpenRouterConfig {
+    /// Base URL endpoint (default "https://openrouter.ai").
     std::string endpoint{"https://openrouter.ai"};
+    /// API path prefix (default "/api/v1").
     std::string api_path_prefix{"/api/v1"};
-    std::string http_referer; // Optional HTTP-Referer header
-    std::string app_title;    // Optional X-Title header
+    /// Optional HTTP-Referer header for OpenRouter analytics and rankings.
+    std::string http_referer;
+    /// Optional X-Title header identifying the application to OpenRouter.
+    std::string app_title;
 };
 
+/**
+ * @brief Model provider implementation for the OpenRouter multi-model gateway.
+ *
+ * Provides access to hundreds of LLM models through a unified OpenAI-compatible endpoint.
+ * Automatically inspects model catalog metadata to discover per-model capabilities
+ * (such as tool-calling support) and adjusts request payloads accordingly.
+ */
 class OpenRouterProvider final : public IModelProvider {
 public:
+    /**
+     * @brief Constructs an OpenRouterProvider with custom configuration.
+     * @param config OpenRouter configuration settings.
+     */
     explicit OpenRouterProvider(OpenRouterConfig config = {});
+
+    /**
+     * @brief Constructs an OpenRouterProvider with endpoint and path prefix.
+     * @param endpoint Base URL endpoint.
+     * @param api_path_prefix API path prefix (default "/api/v1").
+     */
     explicit OpenRouterProvider(std::string endpoint, std::string api_path_prefix = "/api/v1");
     ~OpenRouterProvider() override;
 

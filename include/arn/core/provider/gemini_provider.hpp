@@ -1,3 +1,8 @@
+/**
+ * @file gemini_provider.hpp
+ * @brief Google Gemini API provider implementation.
+ */
+
 #pragma once
 
 #include <memory>
@@ -14,8 +19,18 @@ class Client;
 
 namespace arn::core {
 
+/**
+ * @brief Model provider implementation for the Google Gemini API (v1beta).
+ *
+ * Implements model discovery, contents-based chat history, SSE streaming
+ * via `streamGenerateContent`, function calling declarations, and function responses.
+ */
 class GeminiProvider final : public IModelProvider {
 public:
+    /**
+     * @brief Constructs a GeminiProvider targeting the specified endpoint.
+     * @param endpoint Base URL of the Gemini API (default "https://generativelanguage.googleapis.com").
+     */
     explicit GeminiProvider(std::string endpoint = "https://generativelanguage.googleapis.com");
     ~GeminiProvider() override;
 

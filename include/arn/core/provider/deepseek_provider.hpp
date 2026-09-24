@@ -1,3 +1,8 @@
+/**
+ * @file deepseek_provider.hpp
+ * @brief DeepSeek API provider implementation.
+ */
+
 #pragma once
 
 #include <memory>
@@ -14,8 +19,18 @@ class Client;
 
 namespace arn::core {
 
+/**
+ * @brief Model provider implementation for the DeepSeek API.
+ *
+ * Implements model discovery, OpenAI-compatible chat completions with SSE streaming,
+ * message history preservation, and tool calling via `tools` and `tool_calls`.
+ */
 class DeepSeekProvider final : public IModelProvider {
 public:
+    /**
+     * @brief Constructs a DeepSeekProvider targeting the specified endpoint.
+     * @param endpoint Base URL of the DeepSeek API (default "https://api.deepseek.com").
+     */
     explicit DeepSeekProvider(std::string endpoint = "https://api.deepseek.com");
     ~DeepSeekProvider() override;
 

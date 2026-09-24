@@ -1,3 +1,8 @@
+/**
+ * @file sse_decoder.hpp
+ * @brief Incremental Server-Sent Events (SSE) stream decoder.
+ */
+
 #pragma once
 
 #include <string>
@@ -6,8 +11,20 @@
 
 namespace arn::core::net {
 
+/**
+ * @brief Incremental stream decoder for Server-Sent Events (SSE) conforming to event-stream specifications.
+ *
+ * Buffers partial chunks across network reads, extracts `data:` lines delimited by double newlines,
+ * normalizes CR/LF line endings, and invokes a user callback for each complete event payload.
+ */
 class SseDecoder {
 public:
+    /**
+     * @brief Feeds a chunk of incoming network bytes into the decoder.
+     * @tparam EventFn Callable type accepting `std::string_view` or `const std::string&`.
+     * @param bytes Raw byte slice received from the HTTP stream.
+     * @param on_event Callback invoked for each completely assembled SSE data payload.
+     */
     template <typename EventFn>
     void push(std::string_view bytes, EventFn&& on_event) {
         // Accept both SSE line endings. JSON carriage returns are escaped, so
@@ -49,6 +66,13 @@ public:
         }
     }
 
+    /**
+     * @brief Flushes any trailing buffered data at the end of the stream.
+     *
+     * Handles servers that omit the trailing empty line delimiter before closing the connection.
+     * @tparam EventFn Callable type accepting `std::string_view` or `const std::string&`.
+     * @param on_event Callback invoked for any remaining event payload.
+     */
     template <typename EventFn>
     void finish(EventFn&& on_event) {
         if (pending_.empty())

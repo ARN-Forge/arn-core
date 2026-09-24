@@ -193,3 +193,10 @@ if (BUILD_TESTING)
         target_compile_options(arn_core_openrouter_test PRIVATE /utf-8)
     endif()
 endif()
+
+# Examples
+option(ARN_CORE_BUILD_EXAMPLES "Build example applications" OFF)
+if (ARN_CORE_BUILD_EXAMPLES)
+    add_subdirectory(examples/basic_agent)
+endif()
+
