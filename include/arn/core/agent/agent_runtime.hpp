@@ -19,6 +19,20 @@ struct AgentToolBinding {
     std::vector<OperationClass> operations;
 };
 
+/** @brief Execution boundary used by orchestration hosts.
+ * Implementations execute exactly one AgentProfile/AgentTask context and expose
+ * the existing cancellation path. AgentOrchestrator depends on this boundary so
+ * each stage can receive a separately owned runtime and provider.
+ */
+class IAgentRuntime {
+public:
+    virtual ~IAgentRuntime() = default;
+    [[nodiscard]] virtual AgentResult execute(const AgentContext& context,
+                                              const StreamCallbacks& callbacks = {},
+                                              const ConfirmationFn& confirm = {}) = 0;
+    virtual void cancel_active_request() = 0;
+};
+
 /** @brief Executes one context using an exclusively owned, explicitly injected provider.
  * A fresh AgentSession and filtered registry are created per execute(). Session owns
  * the model/tool loop; runtime owns validation, policy gates and outcome translation.
@@ -45,7 +59,7 @@ struct AgentToolBinding {
  * cancel_active_request() may be called concurrently or from callbacks. The caller
  * must keep this object alive until execute() and cancellation calls return.
  */
-class AgentRuntime {
+class AgentRuntime final : public IAgentRuntime {
 public:
     /// No discovery or network calls; dependencies are checked on execute().
     AgentRuntime(std::unique_ptr<IModelProvider> provider, std::string api_key,
@@ -58,9 +72,9 @@ public:
     /// Existing streaming/progress and confirmation callbacks are forwarded.
     [[nodiscard]] AgentResult execute(const AgentContext& context,
                                       const StreamCallbacks& callbacks = {},
-                                      const ConfirmationFn& confirm = {});
+                                      const ConfirmationFn& confirm = {}) override;
     /// No-op when idle; forwards to the active AgentSession and its cancellation flag.
-    void cancel_active_request();
+    void cancel_active_request() override;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

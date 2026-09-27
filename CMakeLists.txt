@@ -85,6 +85,7 @@ add_library(arn_core
     src/providers/provider_factory.cpp
     src/agent/agent_session.cpp
     src/agent/agent_registry.cpp
+    src/agent/agent_orchestrator.cpp
     src/agent/agent_runtime.cpp
 )
 
@@ -166,6 +167,10 @@ if (BUILD_TESTING)
     add_executable(arn_core_agent_registry_test tests/agent_registry_test.cpp)
     target_link_libraries(arn_core_agent_registry_test PRIVATE arn::core)
     add_test(NAME arn_core_agent_registry COMMAND arn_core_agent_registry_test)
+
+    add_executable(arn_core_agent_orchestrator_test tests/agent_orchestrator_test.cpp)
+    target_link_libraries(arn_core_agent_orchestrator_test PRIVATE arn::core)
+    add_test(NAME arn_core_agent_orchestrator COMMAND arn_core_agent_orchestrator_test)
     # Header-only data model: deliberately builds without provider/network dependencies.
     add_executable(arn_core_agent_data_test tests/agent_data_test.cpp)
     target_include_directories(arn_core_agent_data_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -206,6 +211,7 @@ if (BUILD_TESTING)
         set(_arn_test_targets
             arn_core_agent_runtime_test
             arn_core_agent_registry_test
+            arn_core_agent_orchestrator_test
             arn_core_agent_data_test arn_core_sse_test arn_core_retry_test
             arn_core_tool_registry_test arn_core_provider_test
             arn_core_agent_session_test arn_core_openrouter_test)
@@ -253,6 +259,7 @@ if (BUILD_TESTING)
     if (MSVC)
         target_compile_options(arn_core_agent_runtime_test PRIVATE /utf-8)
         target_compile_options(arn_core_agent_registry_test PRIVATE /utf-8)
+        target_compile_options(arn_core_agent_orchestrator_test PRIVATE /utf-8)
         target_compile_options(arn_core_agent_data_test PRIVATE /utf-8)
         target_compile_options(arn_core_sse_test PRIVATE /utf-8)
         target_compile_options(arn_core_retry_test PRIVATE /utf-8)
