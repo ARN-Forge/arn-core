@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <utility>
 
 namespace arn::core::detail {
 
@@ -36,10 +37,59 @@ std::string lower_ascii(std::string value) {
     return value;
 }
 
+namespace {
+
+// Gemini function declarations accept only a subset of OpenAPI Schema. In
+// particular, the v1beta function-declaration endpoint rejects the standard
+// JSON Schema `additionalProperties` keyword even though OpenAI-compatible
+// providers accept and use it. Remove that keyword only from schema nodes in
+// the Gemini wire representation; the ToolRegistry's canonical schema remains
+// unchanged for validation and for OpenRouter/DeepSeek serialization.
+nlohmann::json gemini_function_schema(const nlohmann::json& schema) {
+    if (!schema.is_object())
+        return schema;
+
+    nlohmann::json result = schema;
+    result.erase("additionalProperties");
+
+    for (const auto key : {"properties", "$defs", "defs", "definitions"}) {
+        const auto it = result.find(key);
+        if (it == result.end() || !it->is_object())
+            continue;
+        for (auto& [_, child] : it->items())
+            child = gemini_function_schema(child);
+    }
+
+    for (const auto key : {"items", "not"}) {
+        const auto it = result.find(key);
+        if (it != result.end() && it->is_object())
+            *it = gemini_function_schema(*it);
+    }
+
+    for (const auto key : {"prefixItems", "anyOf", "oneOf", "allOf"}) {
+        const auto it = result.find(key);
+        if (it == result.end() || !it->is_array())
+            continue;
+        for (auto& child : *it)
+            child = gemini_function_schema(child);
+    }
+
+    return result;
+}
+
+} // namespace
+
 nlohmann::json serialize_gemini_tools(const ToolRegistry& tools) {
     if (tools.empty())
         return nlohmann::json::array();
-    return nlohmann::json::array({{{"functionDeclarations", tools.definitions_json()}}});
+
+    auto declarations = tools.definitions_json();
+    for (auto& declaration : declarations) {
+        const auto parameters = declaration.find("parameters");
+        if (parameters != declaration.end())
+            *parameters = gemini_function_schema(*parameters);
+    }
+    return nlohmann::json::array({{{"functionDeclarations", std::move(declarations)}}});
 }
 
 nlohmann::json build_gemini_payload(const std::string& system_instruction,

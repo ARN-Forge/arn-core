@@ -4,6 +4,7 @@
 #include "arn/core/tool/tool_registry.hpp"
 #include "providers/provider_utils.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -25,9 +26,17 @@ public:
             {
                 {"type", "object"},
                 {"properties", {
-                    {"query", {{"type", "string"}, {"description", "The query to search"}}}
+                    {"query", {{"type", "string"}, {"description", "The query to search"}}},
+                    {"filters", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"category", {{"type", "string"}}}
+                        }},
+                        {"additionalProperties", false}
+                    }}
                 }},
-                {"required", {"query"}}
+                {"required", {"query"}},
+                {"additionalProperties", false}
             }
         };
         return def;
@@ -138,11 +147,45 @@ int main() {
         check(decls[0].value("name", "") == "get_weather" || decls[1].value("name", "") == "get_weather", "Gemini tool weather name");
         check(decls[0].value("name", "") == "search_docs" || decls[1].value("name", "") == "search_docs", "Gemini tool search name");
 
+        const auto search_decl = std::ranges::find_if(decls, [](const auto& declaration) {
+            return declaration.value("name", "") == "search_docs";
+        });
+        check(search_decl != decls.end(), "Gemini search declaration exists");
+        const auto& gemini_parameters = search_decl->at("parameters");
+        check(!gemini_parameters.contains("additionalProperties"),
+              "Gemini root schema must omit additionalProperties");
+        check(!gemini_parameters["properties"]["filters"].contains("additionalProperties"),
+              "Gemini nested schema must omit additionalProperties");
+
+        // Provider-specific adaptation must not mutate the canonical schema or
+        // remove validation keywords from OpenAI-compatible providers.
+        const auto canonical_defs = registry.definitions_json();
+        const auto canonical_search = std::ranges::find_if(canonical_defs, [](const auto& definition) {
+            return definition.value("name", "") == "search_docs";
+        });
+        check(canonical_search != canonical_defs.end(), "Canonical search definition exists");
+        check(canonical_search->at("parameters").contains("additionalProperties"),
+              "Gemini serialization mutated the canonical tool schema");
+
         // DeepSeek tool serialization
         const auto deepseek_tools = arn::core::detail::serialize_deepseek_tools(registry);
         check(deepseek_tools.is_array() && deepseek_tools.size() == 2, "DeepSeek tools structure");
         check(deepseek_tools[0]["type"] == "function" && deepseek_tools[0].contains("function"), "DeepSeek tool item");
         check(deepseek_tools[1]["type"] == "function" && deepseek_tools[1].contains("function"), "DeepSeek tool item");
+        const auto deepseek_search = std::ranges::find_if(deepseek_tools, [](const auto& tool) {
+            return tool["function"].value("name", "") == "search_docs";
+        });
+        check(deepseek_search != deepseek_tools.end(), "DeepSeek search definition exists");
+        check(deepseek_search->at("function")["parameters"].contains("additionalProperties"),
+              "DeepSeek lost additionalProperties");
+
+        const auto openrouter_tools = arn::core::detail::serialize_openrouter_tools(registry);
+        const auto openrouter_search = std::ranges::find_if(openrouter_tools, [](const auto& tool) {
+            return tool["function"].value("name", "") == "search_docs";
+        });
+        check(openrouter_search != openrouter_tools.end(), "OpenRouter search definition exists");
+        check(openrouter_search->at("function")["parameters"].contains("additionalProperties"),
+              "OpenRouter lost additionalProperties");
 
         // 4. Payload construction & system instruction propagation
         nlohmann::json gemini_contents = nlohmann::json::array();
