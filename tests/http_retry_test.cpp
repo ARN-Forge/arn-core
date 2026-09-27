@@ -1,6 +1,7 @@
 #include "arn/core/net/http_client.hpp"
 #include "arn/core/net/model_parser.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <iostream>
 #include <stdexcept>
@@ -99,7 +100,60 @@ int main() {
             check(call_count == 1, "Cancelled request should not retry after first attempt");
         }
 
-        // Test 6: parse_model_list in arn::core::net
+        // Test 6: streaming retries report bounded, useful progress
+        {
+            int call_count = 0;
+            bool received_event = false;
+            std::string error_body = R"({"error":{"message":"Too many requests"}})";
+            std::vector<std::string> progress;
+            auto request = [&]() -> httplib::Result {
+                ++call_count;
+                httplib::Response resp;
+                resp.status = 429;
+                resp.set_header("Retry-After", "0");
+                return httplib::Result(std::make_unique<httplib::Response>(resp),
+                                       httplib::Error::Success);
+            };
+            const auto result = arn::core::net::execute_stream_with_retry(
+                request, received_event, error_body, nullptr,
+                arn::core::net::ProgressCallback{
+                    [&](std::string_view message) { progress.emplace_back(message); }}, 3);
+            check(result && result->status == 429 && call_count == 3,
+                  "Retryable 429 should stop at the configured attempt limit");
+            check(std::ranges::any_of(progress, [](const std::string& message) {
+                      return message.find("Rate limited by provider; retrying in 0s") !=
+                          std::string::npos;
+                  }), "Retry progress should explain the reason and delay");
+        }
+
+        // Test 7: exhausted quota is terminal and is not retried
+        {
+            int call_count = 0;
+            bool received_event = false;
+            std::string error_body =
+                R"({"error":{"message":"You exceeded your current quota. Check billing."}})";
+            std::vector<std::string> progress;
+            auto request = [&]() -> httplib::Result {
+                ++call_count;
+                httplib::Response resp;
+                resp.status = 429;
+                return httplib::Result(std::make_unique<httplib::Response>(resp),
+                                       httplib::Error::Success);
+            };
+            const auto result = arn::core::net::execute_stream_with_retry(
+                request, received_event, error_body, nullptr,
+                arn::core::net::ProgressCallback{
+                    [&](std::string_view message) { progress.emplace_back(message); }}, 3);
+            check(result && result->status == 429 && call_count == 1,
+                  "Hard quota exhaustion must not be retried");
+            check(!arn::core::net::should_retry(result, error_body),
+                  "Hard quota response should be terminal");
+            check(std::ranges::any_of(progress, [](const std::string& message) {
+                      return message.find("quota is exhausted") != std::string::npos;
+                  }), "Hard quota progress should explain why no retry occurs");
+        }
+
+        // Test 8: parse_model_list in arn::core::net
         {
             const std::string gemini_json = R"({"models":[{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}]})";
             const auto models = arn::core::net::parse_model_list(gemini_json, true);

@@ -2,15 +2,40 @@
 #include "arn/core/net/sse_decoder.hpp"
 
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <random>
 #include <string>
 
 namespace arn::core::net {
 
-bool should_retry(const httplib::Result& response) {
+bool is_hard_quota_response(const httplib::Result& response, std::string_view error_body) {
+    if (!response || response->status != 429)
+        return false;
+
+    std::string detail(error_body.empty() ? std::string_view(response->body) : error_body);
+    std::ranges::transform(detail, detail.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    constexpr std::string_view hard_quota_markers[] = {
+        "exceeded your current quota",
+        "quota exhausted",
+        "billing account",
+        "billing required",
+        "insufficient_quota",
+        "limit: 0",
+    };
+    return std::ranges::any_of(hard_quota_markers, [&](std::string_view marker) {
+        return detail.find(marker) != std::string::npos;
+    });
+}
+
+bool should_retry(const httplib::Result& response, std::string_view error_body) {
     if (!response)
         return true;
     const int status = response->status;
+    if (status == 429 && is_hard_quota_response(response, error_body))
+        return false;
     return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
 }
 
@@ -37,6 +62,7 @@ httplib::Result stream_post(httplib::Client& client, const std::string& path,
                             const EventCallback& on_event,
                             std::string& error_body, bool& received_event,
                             const std::atomic_bool* cancel_requested) {
+    error_body.clear();
     httplib::Request request;
     request.method = "POST";
     request.path = path;

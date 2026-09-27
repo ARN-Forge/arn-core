@@ -25,14 +25,27 @@ using ProgressCallback = std::function<void(std::string_view message)>;
 using EventCallback = std::function<void(std::string_view event_data)>;
 
 /**
- * @brief Evaluates whether an HTTP result is transient and eligible for retry.
- *
- * Returns true for network transport errors (null response) and HTTP status codes 429 and 5xx.
+ * @brief Detects a 429 response that clearly reports exhausted quota or billing limits.
  *
  * @param response httplib::Result returned from a request.
+ * @param error_body Optional provider error body used for quota classification.
+ * @return True when immediately retrying cannot succeed without a quota/billing change.
+ */
+[[nodiscard]] bool is_hard_quota_response(const httplib::Result& response,
+                                          std::string_view error_body = {});
+
+/**
+ * @brief Evaluates whether an HTTP result is transient and eligible for retry.
+ *
+ * Returns true for network transport errors (null response) and transient HTTP status codes
+ * 429 and 5xx. A 429 body that clearly reports exhausted quota is terminal.
+ *
+ * @param response httplib::Result returned from a request.
+ * @param error_body Optional provider error body used for quota classification.
  * @return True if the request should be retried, false otherwise.
  */
-[[nodiscard]] bool should_retry(const httplib::Result& response);
+[[nodiscard]] bool should_retry(const httplib::Result& response,
+                                std::string_view error_body = {});
 
 /**
  * @brief Computes the backoff duration before the next retry attempt.
@@ -81,6 +94,7 @@ auto execute_with_retry(RequestFn&& request, const std::atomic_bool* cancel_requ
  * @tparam ProgressFn Callable receiving progress messages.
  * @param request Lambda executing the streaming HTTP request.
  * @param received_event Reference to boolean tracking if any event payload was delivered.
+ * @param error_body Current provider error response used to classify hard quota failures.
  * @param cancel_requested Optional pointer to atomic cancellation flag.
  * @param on_progress Optional callback for status and retry notices.
  * @param max_attempts Maximum attempts allowed (default 3).
@@ -88,6 +102,7 @@ auto execute_with_retry(RequestFn&& request, const std::atomic_bool* cancel_requ
  */
 template <typename RequestFn, typename ProgressFn = ProgressCallback>
 auto execute_stream_with_retry(RequestFn&& request, const bool& received_event,
+                               const std::string& error_body,
                                const std::atomic_bool* cancel_requested = nullptr,
                                const ProgressFn& on_progress = {},
                                int max_attempts = max_request_attempts) {
@@ -96,16 +111,30 @@ auto execute_stream_with_retry(RequestFn&& request, const bool& received_event,
             on_progress("Waiting for provider response (attempt " + std::to_string(attempt + 1) +
                         ")");
         auto response = request();
+        const bool hard_quota = is_hard_quota_response(response, error_body);
         // Never replay a partially printed answer: retrying then would show
         // duplicated text to the person using ARN.
         if ((cancel_requested && cancel_requested->load(std::memory_order_relaxed)) ||
-            received_event || !should_retry(response) || attempt + 1 >= max_attempts ||
-            (!response && response.error() == httplib::Error::Read))
+            received_event || hard_quota || !should_retry(response, error_body) ||
+            attempt + 1 >= max_attempts || (!response && response.error() == httplib::Error::Read)) {
+            if (hard_quota && on_progress)
+                on_progress("Provider quota is exhausted; this request will not be retried");
             return response;
+        }
         // A full idle read timeout already waited 90 seconds. Do not silently repeat it.
-        if (on_progress)
-            on_progress("Provider unavailable or rate-limited; waiting before retry");
-        const auto deadline = std::chrono::steady_clock::now() + retry_delay(response, attempt);
+        const auto delay = retry_delay(response, attempt);
+        if (on_progress) {
+            const auto retry_number = attempt + 2;
+            const auto delay_ms = delay.count();
+            const auto delay_text = delay_ms % 1000 == 0
+                ? std::to_string(delay_ms / 1000) + "s"
+                : std::to_string(delay_ms) + "ms";
+            const std::string reason = response && response->status == 429
+                ? "Rate limited by provider" : "Provider temporarily unavailable";
+            on_progress(reason + "; retrying in " + delay_text + " (attempt " +
+                        std::to_string(retry_number) + "/" + std::to_string(max_attempts) + ")");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + delay;
         while (std::chrono::steady_clock::now() < deadline) {
             if (cancel_requested && cancel_requested->load())
                 return response;

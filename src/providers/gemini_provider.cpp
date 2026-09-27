@@ -141,7 +141,7 @@ ModelTurn GeminiProvider::execute_turn_request(
                 },
                 error_body, received_event, cancel_requested);
         },
-        received_event, cancel_requested, callbacks.on_progress);
+        received_event, error_body, cancel_requested, callbacks.on_progress);
 
     if (cancel_requested && cancel_requested->load(std::memory_order_relaxed)) {
         return {.ok = false, .error_message = "Request cancelled.", .cancelled = true};
