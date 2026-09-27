@@ -1,0 +1,37 @@
+# Build-time PE dependency scan. Keep compatible with the CMake 3.20 minimum.
+cmake_minimum_required(VERSION 3.20)
+if (POLICY CMP0207)
+    cmake_policy(SET CMP0207 NEW)
+endif()
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM windows+pe)
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL "@ARN_TEST_PE_TOOL@")
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "@ARN_TEST_PE_SCANNER@")
+set(_executables "@ARN_TEST_EXECUTABLES@")
+set(_search_dirs "@ARN_TEST_RUNTIME_DIRS@")
+list(REMOVE_DUPLICATES _search_dirs)
+foreach(_executable IN LISTS _executables)
+    file(GET_RUNTIME_DEPENDENCIES
+        EXECUTABLES "${_executable}"
+        DIRECTORIES ${_search_dirs}
+        RESOLVED_DEPENDENCIES_VAR _resolved
+        UNRESOLVED_DEPENDENCIES_VAR _unresolved
+        PRE_EXCLUDE_REGEXES "[Aa][Pp][Ii]-[Mm][Ss]-.*" "[Ee][Xx][Tt]-[Mm][Ss]-.*"
+        POST_EXCLUDE_REGEXES
+            ".*[/\\\\][Ss][Yy][Ss][Tt][Ee][Mm]32[/\\\\].*"
+            ".*[/\\\\][Ss][Yy][Ss][Ww][Oo][Ww]64[/\\\\].*"
+            ".*[/\\\\][Ww][Ii][Nn][Ss][Xx][Ss][/\\\\].*")
+    if (_unresolved)
+        message(FATAL_ERROR "Unresolved runtime dependencies for ${_executable}: ${_unresolved}")
+    endif()
+    get_filename_component(_destination "${_executable}" DIRECTORY)
+    foreach(_dll IN LISTS _resolved)
+        get_filename_component(_source_dir "${_dll}" DIRECTORY)
+        if (NOT _source_dir STREQUAL _destination)
+            execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${_dll}" "${_destination}" RESULT_VARIABLE _copy_result)
+            if (NOT _copy_result EQUAL 0)
+                message(FATAL_ERROR "Could not deploy ${_dll} to ${_destination}")
+            endif()
+        endif()
+    endforeach()
+endforeach()

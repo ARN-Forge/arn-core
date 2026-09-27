@@ -84,6 +84,7 @@ add_library(arn_core
     src/providers/openrouter_provider.cpp
     src/providers/provider_factory.cpp
     src/agent/agent_session.cpp
+    src/agent/agent_runtime.cpp
 )
 
 set_target_properties(arn_core PROPERTIES EXPORT_NAME core)
@@ -157,6 +158,15 @@ endif()
 
 # Tests
 if (BUILD_TESTING)
+    add_executable(arn_core_agent_runtime_test tests/agent_runtime_test.cpp)
+    target_link_libraries(arn_core_agent_runtime_test PRIVATE arn::core)
+    add_test(NAME arn_core_agent_runtime COMMAND arn_core_agent_runtime_test)
+    # Header-only data model: deliberately builds without provider/network dependencies.
+    add_executable(arn_core_agent_data_test tests/agent_data_test.cpp)
+    target_include_directories(arn_core_agent_data_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(arn_core_agent_data_test PRIVATE cxx_std_23)
+    add_test(NAME arn_core_agent_data COMMAND arn_core_agent_data_test)
+
     add_executable(arn_core_sse_test tests/sse_decoder_test.cpp)
     target_link_libraries(arn_core_sse_test PRIVATE arn::core)
     add_test(NAME arn_core_sse COMMAND arn_core_sse_test)
@@ -184,7 +194,59 @@ if (BUILD_TESTING)
     target_link_libraries(arn_core_openrouter_test PRIVATE arn::core)
     add_test(NAME arn_core_openrouter COMMAND arn_core_openrouter_test)
 
+    if (WIN32)
+        # FindOpenSSL may expose UNKNOWN imported .lib targets, so
+        # TARGET_RUNTIME_DLLS alone cannot discover their runtime DLLs.
+        # Scan the built PE files instead (supported since CMake 3.16).
+        set(_arn_test_targets
+            arn_core_agent_runtime_test
+            arn_core_agent_data_test arn_core_sse_test arn_core_retry_test
+            arn_core_tool_registry_test arn_core_provider_test
+            arn_core_agent_session_test arn_core_openrouter_test)
+        set(ARN_TEST_EXECUTABLES "")
+        set(ARN_TEST_RUNTIME_DIRS "$<TARGET_FILE_DIR:arn_core>")
+        foreach(_target IN LISTS _arn_test_targets)
+            list(APPEND ARN_TEST_EXECUTABLES "$<TARGET_FILE:${_target}>")
+            list(APPEND ARN_TEST_RUNTIME_DIRS "$<TARGET_FILE_DIR:${_target}>")
+        endforeach()
+        # Derive search hints from the selected dependency installation, not PATH.
+        foreach(_include IN LISTS OPENSSL_INCLUDE_DIR)
+            get_filename_component(_prefix "${_include}" DIRECTORY)
+            list(APPEND ARN_TEST_RUNTIME_DIRS "${_prefix}/bin" "${_prefix}")
+        endforeach()
+        if (OPENSSL_ROOT_DIR)
+            list(APPEND ARN_TEST_RUNTIME_DIRS "${OPENSSL_ROOT_DIR}/bin" "${OPENSSL_ROOT_DIR}")
+        endif()
+        foreach(_target OpenSSL::SSL OpenSSL::Crypto)
+            if (TARGET ${_target})
+                list(APPEND ARN_TEST_RUNTIME_DIRS "$<TARGET_FILE_DIR:${_target}>")
+            endif()
+        endforeach()
+        # Script mode has no compiler detection; reuse the selected toolchain.
+        if (MSVC)
+            get_filename_component(_linker_dir "${CMAKE_LINKER}" DIRECTORY)
+            find_program(ARN_TEST_PE_SCANNER NAMES dumpbin HINTS "${_linker_dir}" REQUIRED)
+            set(ARN_TEST_PE_TOOL dumpbin)
+        else()
+            get_filename_component(_objdump_dir "${CMAKE_OBJDUMP}" DIRECTORY)
+            find_program(ARN_TEST_PE_SCANNER NAMES objdump HINTS "${_objdump_dir}" REQUIRED)
+            set(ARN_TEST_PE_TOOL objdump)
+        endif()
+        configure_file(cmake/DeployTestRuntime.cmake.in
+            "${CMAKE_CURRENT_BINARY_DIR}/DeployTestRuntime.configured.cmake" @ONLY)
+        file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/DeployTestRuntime-$<CONFIG>.cmake"
+            INPUT "${CMAKE_CURRENT_BINARY_DIR}/DeployTestRuntime.configured.cmake")
+        # Runs even when linking is up-to-date; one deployment avoids parallel copy races.
+        add_custom_target(arn_core_test_runtime ALL
+            COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_BINARY_DIR}/DeployTestRuntime-$<CONFIG>.cmake"
+            DEPENDS ${_arn_test_targets}
+            COMMENT "Deploying runtime dependencies for ARN Core tests"
+            VERBATIM)
+    endif()
+
     if (MSVC)
+        target_compile_options(arn_core_agent_runtime_test PRIVATE /utf-8)
+        target_compile_options(arn_core_agent_data_test PRIVATE /utf-8)
         target_compile_options(arn_core_sse_test PRIVATE /utf-8)
         target_compile_options(arn_core_retry_test PRIVATE /utf-8)
         target_compile_options(arn_core_tool_registry_test PRIVATE /utf-8)
