@@ -26,6 +26,10 @@ OrchestrationResult preflight_failure(std::string code, std::string message) {
     return result;
 }
 
+AgentResult agent_failure(std::string code, std::string message) {
+    return {AgentStatus::failed, message, {}, AgentError{std::move(code), std::move(message)}};
+}
+
 OrchestrationStatus orchestration_status(AgentStatus status) {
     switch (status) {
     case AgentStatus::completed: return OrchestrationStatus::completed;
@@ -203,9 +207,35 @@ OrchestrationResult AgentOrchestrator::execute(const OrchestrationTask& task,
             return workflow;
         }
 
+        const auto stage_artifact_index = workflow.artifacts.size();
         workflow.artifacts.push_back({stage.output_type, std::string(stage.profile_id), result.summary});
         for (const auto& artifact : result.artifacts)
             if (artifact.type == ArtifactType::test_result) workflow.artifacts.push_back(artifact);
+
+        if (index + 1 < kStages.size() && callbacks.before_next_stage) {
+            ContinuationDecision decision{ContinuationDecision::proceed};
+            try {
+                decision = callbacks.before_next_stage(stage.profile_id, result,
+                                                       workflow.artifacts[stage_artifact_index]);
+            } catch (...) {
+                workflow.status = OrchestrationStatus::failed;
+                workflow.summary = "Orchestration continuation callback failed.";
+                workflow.error = OrchestrationError{"orchestration_callback_failed",
+                                                    workflow.summary,
+                                                    std::string(stage.profile_id)};
+                return workflow;
+            }
+            if (cancel_requested_.load() || decision == ContinuationDecision::cancel) {
+                workflow.status = OrchestrationStatus::cancelled;
+                workflow.summary = "Workflow cancelled.";
+                return workflow;
+            }
+            if (decision == ContinuationDecision::decline) {
+                workflow.status = OrchestrationStatus::continuation_declined;
+                workflow.summary = "Workflow continuation declined.";
+                return workflow;
+            }
+        }
     }
 
     workflow.status = OrchestrationStatus::completed;
@@ -213,10 +243,74 @@ OrchestrationResult AgentOrchestrator::execute(const OrchestrationTask& task,
     return workflow;
 }
 
-void AgentOrchestrator::cancel_active_workflow() {
+AgentResult AgentOrchestrator::execute_agent(std::string_view profile_id,
+                                             const AgentTask& task,
+                                             const StreamCallbacks& callbacks,
+                                             const ConfirmationFn& confirm) {
+    if (executing_.exchange(true))
+        return agent_failure("orchestrator_busy", "An agent execution is already running.");
+    struct ExecutionGuard {
+        std::atomic_bool& executing;
+        ~ExecutionGuard() { executing.store(false); }
+    } execution_guard{executing_};
+    cancel_requested_.store(false);
+
+    if (!task.valid())
+        return agent_failure("invalid_agent_task",
+                             "Agent execution requires an ID, objective, working directory and positive budget.");
+    if (!runtime_factory_)
+        return agent_failure("missing_runtime_factory", "An agent runtime factory is required.");
+    const auto profile = registry_.find(profile_id);
+    if (!profile)
+        return agent_failure("unknown_agent_profile",
+                             "The requested agent profile is not registered.");
+
+    std::unique_ptr<IAgentRuntime> runtime;
+    try {
+        runtime = runtime_factory_(*profile);
+    } catch (...) {
+        return agent_failure("runtime_factory_failed", "Agent runtime construction failed.");
+    }
+    if (!runtime)
+        return agent_failure("runtime_factory_failed", "Agent runtime factory returned no runtime.");
+
+    AgentContext context;
+    context.profile = *profile;
+    context.task = task;
+    {
+        std::lock_guard lock(active_mutex_);
+        active_runtime_ = runtime.get();
+    }
+
+    AgentResult result;
+    try {
+        if (cancel_requested_.load()) {
+            result = {AgentStatus::cancelled, "Execution cancelled.", {}, std::nullopt};
+        } else {
+            result = runtime->execute(context, callbacks, confirm);
+        }
+    } catch (...) {
+        result = agent_failure("execution_exception", "Agent runtime execution failed.");
+    }
+    {
+        std::lock_guard lock(active_mutex_);
+        active_runtime_ = nullptr;
+    }
+    if (cancel_requested_.load() || result.status == AgentStatus::cancelled)
+        return {AgentStatus::cancelled,
+                result.summary.empty() ? "Execution cancelled." : result.summary,
+                std::move(result.artifacts), std::nullopt};
+    return result;
+}
+
+void AgentOrchestrator::cancel_active_execution() {
     cancel_requested_.store(true);
     std::lock_guard lock(active_mutex_);
     if (active_runtime_) active_runtime_->cancel_active_request();
+}
+
+void AgentOrchestrator::cancel_active_workflow() {
+    cancel_active_execution();
 }
 
 } // namespace arn::core

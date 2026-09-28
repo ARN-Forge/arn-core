@@ -32,7 +32,17 @@ struct OrchestrationTask {
     [[nodiscard]] bool valid() const;
 };
 
-enum class OrchestrationStatus { completed, failed, cancelled, needs_input, needs_confirmation };
+enum class OrchestrationStatus {
+    completed,
+    failed,
+    cancelled,
+    continuation_declined,
+    needs_input,
+    needs_confirmation
+};
+
+/** @brief Host decision made after a completed stage and before the next stage. */
+enum class ContinuationDecision { proceed, decline, cancel };
 
 struct AgentExecutionRecord {
     std::string profile_id;
@@ -58,6 +68,12 @@ struct OrchestrationResult {
 struct OrchestrationCallbacks {
     std::function<void(std::string_view profile_id)> on_stage_started;
     std::function<void(std::string_view profile_id, const AgentResult& result)> on_stage_finished;
+    /** Called only between successful stages. The artifact is the exact semantic
+     * stage output that will be supplied to downstream contexts if execution proceeds.
+     */
+    std::function<ContinuationDecision(std::string_view profile_id,
+                                       const AgentResult& result,
+                                       const ContextArtifact& artifact)> before_next_stage;
     /// Forwarded to each active AgentRuntime. Stage callbacks identify its owner.
     StreamCallbacks runtime;
 };
@@ -89,6 +105,12 @@ public:
     [[nodiscard]] OrchestrationResult execute(const OrchestrationTask& task,
                                               const OrchestrationCallbacks& callbacks = {},
                                               const ConfirmationFn& confirm = {});
+    /** Executes exactly one registered profile through a fresh AgentRuntime. */
+    [[nodiscard]] AgentResult execute_agent(std::string_view profile_id,
+                                            const AgentTask& task,
+                                            const StreamCallbacks& callbacks = {},
+                                            const ConfirmationFn& confirm = {});
+    void cancel_active_execution();
     void cancel_active_workflow();
 
 private:

@@ -297,6 +297,83 @@ void cancellation_between_stages() {
           "Between-stage cancellation prevents Planner");
 }
 
+void continuation_control_preserves_plan_and_records() {
+    {
+        auto state = default_state();
+        AgentOrchestrator orchestrator{standard_agents::make_registry(), factory_for(state)};
+        std::vector<std::string> checkpoints;
+        std::string planner_artifact;
+        OrchestrationCallbacks callbacks;
+        callbacks.before_next_stage = [&](std::string_view id, const AgentResult& result,
+                                          const ContextArtifact& artifact) {
+            checkpoints.emplace_back(id);
+            check(result.summary == artifact.content,
+                  "Continuation receives the semantic stage result");
+            if (id == standard_agents::planner_id) {
+                check(artifact.type == ArtifactType::implementation_plan,
+                      "Planner checkpoint receives implementation plan artifact");
+                planner_artifact = artifact.content;
+                return ContinuationDecision::decline;
+            }
+            return ContinuationDecision::proceed;
+        };
+        const auto result = orchestrator.execute(task(), callbacks);
+        check(result.status == OrchestrationStatus::continuation_declined,
+              "Host decline has a dedicated status");
+        check(state->created == std::vector<std::string>{"explorer", "planner"},
+              "Host decline prevents Coder and Reviewer");
+        check(result.executions.size() == 2 && planner_artifact == "plan",
+              "Completed records and real Planner artifact are retained");
+        check(checkpoints == std::vector<std::string>{"explorer", "planner"},
+              "Continuation callback runs only between completed stages");
+    }
+    {
+        auto state = default_state();
+        AgentOrchestrator orchestrator{standard_agents::make_registry(), factory_for(state)};
+        OrchestrationCallbacks callbacks;
+        callbacks.before_next_stage = [&](std::string_view id, const AgentResult&,
+                                          const ContextArtifact&) {
+            return id == standard_agents::planner_id
+                ? ContinuationDecision::cancel : ContinuationDecision::proceed;
+        };
+        const auto result = orchestrator.execute(task(), callbacks);
+        check(result.status == OrchestrationStatus::cancelled,
+              "Checkpoint cancellation remains distinct from decline");
+        check(result.executions.size() == 2
+                  && state->created == std::vector<std::string>{"explorer", "planner"},
+              "Checkpoint cancellation preserves completed records and stops later stages");
+    }
+}
+
+void direct_registered_agent_execution() {
+    auto state = default_state();
+    AgentOrchestrator orchestrator{standard_agents::make_registry(), factory_for(state)};
+    const auto order = expected_order();
+    for (const auto& id : order) {
+        AgentTask direct_task;
+        direct_task.id = "direct:" + id;
+        direct_task.objective = "Run one profile";
+        direct_task.working_directory = "virtual-workspace";
+        const auto result = orchestrator.execute_agent(id, direct_task);
+        check(result.status == AgentStatus::completed,
+              "Direct registered agent completes with AgentResult semantics");
+    }
+    check(state->created == order, "Each direct call creates only the requested runtime");
+    check(state->contexts.size() == 4, "Direct calls create four isolated contexts");
+    for (std::size_t index = 0; index < order.size(); ++index)
+        check(state->contexts[index].profile.id == order[index],
+              "Direct execution uses the selected registry profile");
+
+    AgentTask valid;
+    valid.id = "direct:missing";
+    valid.objective = "Missing profile";
+    valid.working_directory = "virtual-workspace";
+    const auto missing = orchestrator.execute_agent("missing", valid);
+    check(missing.status == AgentStatus::failed && missing.error
+              && missing.error->code == "unknown_agent_profile",
+          "Unknown direct profile is rejected before runtime creation");
+}
+
 void sequential_workflows_are_isolated() {
     auto state = default_state();
     AgentOrchestrator orchestrator{standard_agents::make_registry(), factory_for(state)};
@@ -323,6 +400,8 @@ int main() {
     budget_and_missing_profile_fail_before_execution();
     cancellation_during_active_stage();
     cancellation_between_stages();
+    continuation_control_preserves_plan_and_records();
+    direct_registered_agent_execution();
     sequential_workflows_are_isolated();
     return 0;
 }
