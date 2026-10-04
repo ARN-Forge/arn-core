@@ -99,15 +99,26 @@ int main() {
         check(openrouter->name() == "OpenRouter", "OpenRouter name mismatch");
         check(openrouter->session_entries() == 0, "OpenRouter session must start empty");
 
+        auto omniroute = arn::core::create_provider(arn::core::ProviderType::omniroute);
+        check(omniroute != nullptr, "OmniRoute provider creation failed");
+        check(omniroute->type() == arn::core::ProviderType::omniroute, "OmniRoute type mismatch");
+        check(omniroute->kind() == arn::core::ProviderType::omniroute, "OmniRoute kind mismatch");
+        check(omniroute->name() == "OmniRoute", "OmniRoute name mismatch");
+        check(omniroute->session_entries() == 0, "OmniRoute session must start empty");
+
         check(arn::core::provider_type_name(arn::core::ProviderType::gemini) == "Gemini", "Name check");
         check(arn::core::provider_type_name(arn::core::ProviderType::deepseek) == "DeepSeek", "Name check");
         check(arn::core::provider_type_name(arn::core::ProviderType::openrouter) == "OpenRouter", "Name check");
+        check(arn::core::provider_type_name(arn::core::ProviderType::omniroute) == "OmniRoute", "Name check");
         check(arn::core::provider_type_name(arn::core::ProviderType::custom) == "Custom", "Name check");
         check(arn::core::provider_type_name(arn::core::ProviderType::none) == "none", "Name check");
 
         check(arn::core::provider_type_from_name("gemini") == arn::core::ProviderType::gemini, "From name check");
         check(arn::core::provider_type_from_name("deepseek") == arn::core::ProviderType::deepseek, "From name check");
         check(arn::core::provider_type_from_name("openrouter") == arn::core::ProviderType::openrouter, "From name check");
+        check(arn::core::provider_type_from_name("omniroute") == arn::core::ProviderType::omniroute, "From name check");
+        check(arn::core::provider_type_from_name("omni-route") == arn::core::ProviderType::omniroute, "From name check");
+        check(arn::core::provider_type_from_name("omni_route") == arn::core::ProviderType::omniroute, "From name check");
         check(arn::core::provider_type_from_name("custom") == arn::core::ProviderType::custom, "From name check");
         check(arn::core::provider_type_from_name("unknown") == arn::core::ProviderType::none, "From name check");
 
@@ -127,6 +138,16 @@ int main() {
               "DeepSeek reasoner preference check");
         check(deepseek->preferred_model({"other-model"}) == "other-model", "DeepSeek fallback check");
         check(deepseek->preferred_model({}).empty(), "DeepSeek empty check");
+
+        check(omniroute->preferred_model({"kiro", "other-model"}) == "kiro",
+              "OmniRoute kiro preference check");
+        check(omniroute->preferred_model({"anthropic/claude-3.7-sonnet", "openai/gpt-4o"}) == "anthropic/claude-3.7-sonnet",
+              "OmniRoute claude-3.7-sonnet preference check");
+        check(omniroute->preferred_model({"custom-kiro-model"}) == "custom-kiro-model",
+              "OmniRoute substring match check");
+        check(omniroute->preferred_model({"unknown-model"}) == "unknown-model",
+              "OmniRoute fallback check");
+        check(omniroute->preferred_model({}).empty(), "OmniRoute empty check");
 
         // 3. ToolRegistry schema serialization
         arn::core::ToolRegistry empty_registry;

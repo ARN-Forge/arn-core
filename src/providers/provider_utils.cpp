@@ -165,6 +165,99 @@ nlohmann::json build_deepseek_payload(const std::string& model,
     return payload;
 }
 
+namespace {
+
+void accumulate_tool_call_delta(nlohmann::json& tool_calls, const nlohmann::json& change, std::size_t default_index) {
+    if (!change.is_object())
+        return;
+
+    std::size_t index = default_index;
+    if (change.contains("index") && change["index"].is_number()) {
+        const auto raw_index = change["index"].get<std::int64_t>();
+        if (raw_index >= 0) {
+            index = static_cast<std::size_t>(raw_index);
+        }
+    }
+
+    while (tool_calls.size() <= index) {
+        tool_calls.push_back(nlohmann::json{
+            {"id", ""},
+            {"type", "function"},
+            {"function", {{"name", ""}, {"arguments", ""}}}
+        });
+    }
+
+    auto& call = tool_calls.at(index);
+    if (!call.is_object()) {
+        call = nlohmann::json{
+            {"id", ""},
+            {"type", "function"},
+            {"function", {{"name", ""}, {"arguments", ""}}}
+        };
+    }
+    if (!call.contains("function") || !call["function"].is_object()) {
+        call["function"] = nlohmann::json{{"name", ""}, {"arguments", ""}};
+    }
+    if (!call["function"].contains("name") || !call["function"]["name"].is_string()) {
+        call["function"]["name"] = "";
+    }
+    if (!call["function"].contains("arguments") || !call["function"]["arguments"].is_string()) {
+        call["function"]["arguments"] = "";
+    }
+    if (!call.contains("id") || !call["id"].is_string()) {
+        call["id"] = "";
+    }
+    if (!call.contains("type") || !call["type"].is_string()) {
+        call["type"] = "function";
+    }
+
+    if (change.contains("id") && change["id"].is_string()) {
+        const auto& id_chunk = change["id"].get_ref<const std::string&>();
+        if (!id_chunk.empty()) {
+            std::string current_id = call["id"].get<std::string>();
+            current_id += id_chunk;
+            call["id"] = std::move(current_id);
+        }
+    }
+
+    if (change.contains("type") && change["type"].is_string()) {
+        const auto& type_chunk = change["type"].get_ref<const std::string&>();
+        if (!type_chunk.empty()) {
+            call["type"] = type_chunk;
+        }
+    }
+
+    if (change.contains("function") && change["function"].is_object()) {
+        const auto& function = change["function"];
+        if (function.contains("name") && function["name"].is_string()) {
+            const auto& name_chunk = function["name"].get_ref<const std::string&>();
+            if (!name_chunk.empty()) {
+                std::string current_name = call["function"]["name"].get<std::string>();
+                current_name += name_chunk;
+                call["function"]["name"] = std::move(current_name);
+            }
+        }
+
+        if (function.contains("arguments")) {
+            if (function["arguments"].is_string()) {
+                const auto& args_chunk = function["arguments"].get_ref<const std::string&>();
+                if (!args_chunk.empty()) {
+                    std::string current_args = call["function"]["arguments"].get<std::string>();
+                    current_args += args_chunk;
+                    call["function"]["arguments"] = std::move(current_args);
+                }
+            } else if (!function["arguments"].is_null()) {
+                std::string current_args = call["function"]["arguments"].get<std::string>();
+                if (current_args.empty()) {
+                    call["function"]["arguments"] = function["arguments"].dump();
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
 void parse_deepseek_stream_chunk(std::string_view event,
                                  std::string& text_accumulator,
                                  nlohmann::json& tool_calls,
@@ -233,17 +326,32 @@ std::string join_api_path(std::string_view prefix, std::string_view path) {
 std::vector<OpenRouterModelEntry> parse_openrouter_model_catalog(std::string_view body) {
     const auto document = nlohmann::json::parse(body);
     std::vector<OpenRouterModelEntry> entries;
-    const auto data_it = document.find("data");
-    if (data_it == document.end() || !data_it->is_array())
+    const nlohmann::json* items = nullptr;
+    if (document.is_object()) {
+        const auto data_it = document.find("data");
+        if (data_it != document.end() && data_it->is_array()) {
+            items = &(*data_it);
+        } else {
+            const auto models_it = document.find("models");
+            if (models_it != document.end() && models_it->is_array()) {
+                items = &(*models_it);
+            }
+        }
+    } else if (document.is_array()) {
+        items = &document;
+    }
+    if (!items)
         return entries;
 
-    for (const auto& item : *data_it) {
+    for (const auto& item : *items) {
         if (!item.is_object())
             continue;
-        const auto id_it = item.find("id");
-        if (id_it == item.end() || !id_it->is_string())
-            continue;
-        const auto id = id_it->get<std::string>();
+        std::string id;
+        if (item.contains("id") && item["id"].is_string()) {
+            id = item["id"].get<std::string>();
+        } else if (item.contains("name") && item["name"].is_string()) {
+            id = item["name"].get<std::string>();
+        }
         if (id.empty())
             continue;
 
@@ -277,7 +385,7 @@ std::vector<OpenRouterModelEntry> parse_openrouter_model_catalog(std::string_vie
         std::string desc = item.value("description", "");
 
         entries.push_back(OpenRouterModelEntry{
-            .id = id,
+            .id = std::move(id),
             .name = std::move(name),
             .description = std::move(desc),
             .capabilities = caps
@@ -315,55 +423,65 @@ nlohmann::json build_openrouter_payload(const std::string& model,
 void parse_openrouter_stream_chunk(std::string_view event,
                                    std::string& text_accumulator,
                                    nlohmann::json& tool_calls,
-                                   const TextStreamCallback& on_text) {
-    if (event == "[DONE]")
-        return;
-    try {
-        const auto parsed = nlohmann::json::parse(event);
-        const auto packets = parsed.is_array() ? parsed : nlohmann::json::array({parsed});
-        for (const auto& packet : packets) {
-            if (packet.contains("error"))
-                continue;
-            const auto choices_it = packet.find("choices");
-            if (choices_it == packet.end() || !choices_it->is_array() || choices_it->empty())
-                continue;
-            const auto delta_it = (*choices_it)[0].find("delta");
-            if (delta_it == (*choices_it)[0].end() || !delta_it->is_object())
-                continue;
-            const auto& delta = *delta_it;
-            if (delta.contains("content") && !delta.at("content").is_null()) {
-                const auto chunk = delta.at("content").get<std::string>();
-                text_accumulator += chunk;
-                if (on_text)
-                    on_text(chunk);
+                                   const TextStreamCallback& on_text,
+                                   std::string* stream_error) {
+    if (event == "[DONE]") return;
+    // Callback exceptions are not JSON parse errors and must not be swallowed.
+    const auto parsed = nlohmann::json::parse(event, nullptr, false);
+    if (parsed.is_discarded()) return;
+    const auto packets = parsed.is_array() ? parsed : nlohmann::json::array({parsed});
+    for (const auto& packet : packets) {
+        if (!packet.is_object()) continue;
+        if (packet.contains("error") && !packet["error"].is_null()) {
+            if (stream_error && stream_error->empty()) {
+                const auto& error = packet["error"];
+                if (error.is_string()) *stream_error = error.get<std::string>();
+                else if (error.is_object() && error.contains("message") && error["message"].is_string())
+                    *stream_error = error["message"].get<std::string>();
+                else *stream_error = "Upstream reported an error.";
             }
-            for (const auto& change : delta.value("tool_calls", nlohmann::json::array())) {
-                const auto index = change.value("index", 0U);
-                while (tool_calls.size() <= index) {
-                    tool_calls.push_back(
-                        {{"id", ""},
-                         {"type", "function"},
-                         {"function", {{"name", ""}, {"arguments", ""}}}});
+            continue;
+        }
+        const auto choices_it = packet.find("choices");
+        if (choices_it == packet.end() || !choices_it->is_array() || choices_it->empty()) continue;
+        // ARN requests one completion; do not merge alternative choices together.
+        const auto& choice = choices_it->front();
+        if (!choice.is_object()) continue;
+        const auto delta_it = choice.find("delta");
+        const auto message_it = choice.find("message");
+        const bool snapshot = message_it != choice.end() && message_it->is_object();
+        const nlohmann::json* delta = snapshot ? &*message_it :
+            (delta_it != choice.end() && delta_it->is_object() ? &*delta_it : nullptr);
+        std::string chunk;
+        const auto append_content = [&](const nlohmann::json& content) {
+            if (content.is_string()) chunk += content.get_ref<const std::string&>();
+            else if (content.is_array()) {
+                for (const auto& part : content) {
+                    if (!part.is_object()) continue;
+                    const auto type = part.find("type");
+                    const auto value = part.find("text");
+                    if (type != part.end() && type->is_string() && *type == "text" &&
+                        value != part.end() && value->is_string()) chunk += value->get_ref<const std::string&>();
                 }
-                auto& call = tool_calls.at(index);
-                if (change.contains("id"))
-                    call["id"] = change.at("id");
-                if (change.contains("type"))
-                    call["type"] = change.at("type");
-                if (change.contains("function")) {
-                    const auto& function = change.at("function");
-                    if (function.contains("name"))
-                        call["function"]["name"] = function.at("name");
-                    if (function.contains("arguments")) {
-                        call["function"]["arguments"] =
-                            call["function"]["arguments"].get<std::string>() +
-                            function.at("arguments").get<std::string>();
-                    }
+            }
+        };
+        if (delta && delta->contains("content")) append_content((*delta)["content"]);
+        else if (choice.contains("text")) append_content(choice["text"]);
+        if (snapshot && chunk.starts_with(text_accumulator)) chunk.erase(0, text_accumulator.size());
+        if (!chunk.empty()) {
+            text_accumulator += chunk;
+            if (on_text) on_text(chunk);
+        }
+        if (delta && delta->contains("tool_calls") && (*delta)["tool_calls"].is_array()) {
+            std::size_t index = 0;
+            for (const auto& change : (*delta)["tool_calls"]) {
+                if (snapshot) {
+                    // A complete message replaces its calls, rather than concatenating their IDs twice.
+                    if (index == 0) tool_calls = nlohmann::json::array();
                 }
+                accumulate_tool_call_delta(tool_calls, change, index++);
             }
         }
-    } catch (const std::exception&) {
-        // Ignore malformed transient SSE data
     }
 }
 

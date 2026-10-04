@@ -10,6 +10,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if (MSVC)
+    add_compile_options(/utf-8 /EHsc)
+endif()
+
 include(CTest)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -81,7 +85,9 @@ add_library(arn_core
     src/providers/model_provider.cpp
     src/providers/gemini_provider.cpp
     src/providers/deepseek_provider.cpp
+    src/providers/openai_provider.cpp
     src/providers/openrouter_provider.cpp
+    src/providers/omniroute_provider.cpp
     src/providers/provider_factory.cpp
     src/agent/agent_session.cpp
     src/agent/agent_registry.cpp
@@ -204,6 +210,11 @@ if (BUILD_TESTING)
     target_link_libraries(arn_core_openrouter_test PRIVATE arn::core)
     add_test(NAME arn_core_openrouter COMMAND arn_core_openrouter_test)
 
+    add_executable(arn_core_omniroute_test tests/omniroute_test.cpp)
+    target_include_directories(arn_core_omniroute_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(arn_core_omniroute_test PRIVATE arn::core)
+    add_test(NAME arn_core_omniroute COMMAND arn_core_omniroute_test)
+
     if (WIN32)
         # FindOpenSSL may expose UNKNOWN imported .lib targets, so
         # TARGET_RUNTIME_DLLS alone cannot discover their runtime DLLs.
@@ -214,7 +225,8 @@ if (BUILD_TESTING)
             arn_core_agent_orchestrator_test
             arn_core_agent_data_test arn_core_sse_test arn_core_retry_test
             arn_core_tool_registry_test arn_core_provider_test
-            arn_core_agent_session_test arn_core_openrouter_test)
+            arn_core_agent_session_test arn_core_openrouter_test
+            arn_core_omniroute_test)
         set(ARN_TEST_EXECUTABLES "")
         set(ARN_TEST_RUNTIME_DIRS "$<TARGET_FILE_DIR:arn_core>")
         foreach(_target IN LISTS _arn_test_targets)
@@ -267,6 +279,7 @@ if (BUILD_TESTING)
         target_compile_options(arn_core_provider_test PRIVATE /utf-8)
         target_compile_options(arn_core_agent_session_test PRIVATE /utf-8)
         target_compile_options(arn_core_openrouter_test PRIVATE /utf-8)
+        target_compile_options(arn_core_omniroute_test PRIVATE /utf-8)
     endif()
 endif()
 

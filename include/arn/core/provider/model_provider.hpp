@@ -26,13 +26,14 @@ enum class ProviderType {
     deepseek,   ///< DeepSeek API backend.
     gemini,     ///< Google Gemini API backend.
     openrouter, ///< OpenRouter multi-model gateway backend.
+    omniroute,  ///< OmniRoute multi-model gateway backend.
     custom      ///< Custom or mock provider implementation.
 };
 
 /**
  * @brief Returns the human-readable display name for a provider type.
  * @param type Provider type enum value.
- * @return String view such as "Gemini", "DeepSeek", "OpenRouter".
+ * @return String view such as "Gemini", "DeepSeek", "OpenRouter", "OmniRoute".
  */
 [[nodiscard]] inline std::string_view provider_type_name(ProviderType type) noexcept {
     switch (type) {
@@ -42,6 +43,8 @@ enum class ProviderType {
         return "Gemini";
     case ProviderType::openrouter:
         return "OpenRouter";
+    case ProviderType::omniroute:
+        return "OmniRoute";
     case ProviderType::custom:
         return "Custom";
     case ProviderType::none:
@@ -52,7 +55,7 @@ enum class ProviderType {
 
 /**
  * @brief Parses a ProviderType enum from a string name.
- * @param name Provider identifier string (case-sensitive lowercase: "gemini", "deepseek", "openrouter", "custom").
+ * @param name Provider identifier string (case-sensitive lowercase: "gemini", "deepseek", "openrouter", "omniroute", "custom").
  * @return Corresponding ProviderType or ProviderType::none if unrecognized.
  */
 [[nodiscard]] inline ProviderType provider_type_from_name(std::string_view name) noexcept {
@@ -62,6 +65,8 @@ enum class ProviderType {
         return ProviderType::deepseek;
     if (name == "openrouter" || name == "open-router" || name == "open_router")
         return ProviderType::openrouter;
+    if (name == "omniroute" || name == "omni-route" || name == "omni_route")
+        return ProviderType::omniroute;
     if (name == "custom")
         return ProviderType::custom;
     return ProviderType::none;

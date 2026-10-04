@@ -67,6 +67,7 @@ nlohmann::json build_openrouter_payload(const std::string& model,
 void parse_openrouter_stream_chunk(std::string_view event,
                                    std::string& text_accumulator,
                                    nlohmann::json& tool_calls,
-                                   const TextStreamCallback& on_text);
+                                   const TextStreamCallback& on_text,
+                                   std::string* stream_error = nullptr);
 
 } // namespace arn::core::detail

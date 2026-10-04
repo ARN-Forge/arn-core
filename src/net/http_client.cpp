@@ -73,8 +73,14 @@ httplib::Result stream_post(httplib::Client& client, const std::string& path,
 
     int status = 0;
     SseDecoder decoder;
-    request.response_handler = [&status](const httplib::Response& response) {
+    bool json_response = false;
+    std::string json_body;
+    request.response_handler = [&](const httplib::Response& response) {
         status = response.status;
+        std::string type = response.get_header_value("Content-Type");
+        std::ranges::transform(type, type.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        type = type.substr(0, type.find(';'));
+        json_response = type == "application/json" || type.ends_with("+json");
         return true;
     };
     request.progress = [cancel_requested](std::uint64_t, std::uint64_t) {
@@ -88,6 +94,10 @@ httplib::Result stream_post(httplib::Client& client, const std::string& path,
             error_body.append(data, size);
             return true;
         }
+        if (json_response) {
+            json_body.append(data, size);
+            return true;
+        }
         decoder.push(std::string_view(data, size), [&](std::string_view event) {
             received_event = true;
             on_event(event);
@@ -96,6 +106,11 @@ httplib::Result stream_post(httplib::Client& client, const std::string& path,
     };
     auto response = client.send(request);
     if (response && response->status >= 200 && response->status < 300) {
+        if (json_response && !json_body.empty() &&
+            (!cancel_requested || !cancel_requested->load(std::memory_order_relaxed))) {
+            received_event = true;
+            on_event(json_body);
+        }
         decoder.finish([&](std::string_view event) {
             received_event = true;
             on_event(event);

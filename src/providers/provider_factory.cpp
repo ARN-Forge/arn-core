@@ -2,6 +2,7 @@
 #include "arn/core/provider/gemini_provider.hpp"
 #include "arn/core/provider/deepseek_provider.hpp"
 #include "arn/core/provider/openrouter_provider.hpp"
+#include "arn/core/provider/omniroute_provider.hpp"
 
 namespace arn::core {
 
@@ -13,6 +14,8 @@ std::unique_ptr<IModelProvider> create_provider(ProviderType type) {
         return std::make_unique<DeepSeekProvider>();
     case ProviderType::openrouter:
         return std::make_unique<OpenRouterProvider>();
+    case ProviderType::omniroute:
+        return std::make_unique<OmniRouteProvider>();
     case ProviderType::none:
     case ProviderType::custom:
         return nullptr;
