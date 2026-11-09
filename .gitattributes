@@ -1,0 +1,4 @@
+# The cpp-httplib patch is applied by `git apply` and verified by SHA-256 over
+# LF text; keep its bytes exactly as committed on every platform. Its blank
+# context lines are a single space by design, so skip whitespace checks.
+third_party/cpp-httplib/*.patch -text -whitespace

@@ -43,38 +43,10 @@ if (NOT TARGET nlohmann_json::nlohmann_json)
     endif()
 endif()
 
-if (NOT TARGET httplib::httplib)
-    find_package(httplib 0.18.3 QUIET)
-    if (NOT httplib_FOUND)
-        find_package(OpenSSL REQUIRED)
-        include(FetchContent)
-        FetchContent_Declare(
-            cpp_httplib
-            GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-            GIT_TAG v0.18.3
-            GIT_SHALLOW TRUE
-        )
-        FetchContent_GetProperties(cpp_httplib)
-        if (NOT cpp_httplib_POPULATED)
-            FetchContent_Populate(cpp_httplib)
-        endif()
-        add_library(httplib INTERFACE IMPORTED GLOBAL)
-        target_include_directories(httplib INTERFACE
-            $<BUILD_INTERFACE:${cpp_httplib_SOURCE_DIR}>
-        )
-        target_compile_definitions(httplib INTERFACE
-            CPPHTTPLIB_OPENSSL_SUPPORT
-        )
-        target_link_libraries(httplib INTERFACE
-            Threads::Threads
-            OpenSSL::SSL
-            OpenSSL::Crypto
-            $<$<PLATFORM_ID:Windows>:ws2_32>
-            $<$<PLATFORM_ID:Windows>:crypt32>
-        )
-        add_library(httplib::httplib ALIAS httplib)
-    endif()
-endif()
+# cpp-httplib: arn-core is the only provider and uses a patched v0.18.3
+# (see cmake/ArnCoreHttplib.cmake and third_party/cpp-httplib/README.md).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ArnCoreHttplib.cmake)
+arn_core_add_httplib()
 
 add_library(arn_core
     src/version.cpp
@@ -113,8 +85,7 @@ target_link_libraries(arn_core
     PUBLIC
         $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
         $<INSTALL_INTERFACE:nlohmann_json::nlohmann_json>
-        $<BUILD_INTERFACE:httplib::httplib>
-        $<INSTALL_INTERFACE:httplib::httplib>
+        arn_core_httplib
         Threads::Threads
 )
 
@@ -124,7 +95,7 @@ endif()
 
 # Installation and packaging (only when built as top-level project)
 if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-    install(TARGETS arn_core
+    install(TARGETS arn_core arn_core_httplib
         EXPORT arn_coreTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -134,6 +105,12 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 
     install(DIRECTORY include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    # The patched httplib.h ships with arn-core, so installed consumers compile
+    # against exactly the header the library was built with.
+    install(FILES "${ARN_CORE_HTTPLIB_HEADER}"
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/arn/core/third_party/cpp-httplib
     )
 
     install(EXPORT arn_coreTargets
@@ -191,6 +168,12 @@ if (BUILD_TESTING)
     target_link_libraries(arn_core_retry_test PRIVATE arn::core)
     add_test(NAME arn_core_retry COMMAND arn_core_retry_test)
 
+    # Per-request HTTP cancellation in the patched cpp-httplib; local servers only.
+    add_executable(arn_core_http_interrupt_test tests/http_interrupt_test.cpp)
+    target_link_libraries(arn_core_http_interrupt_test PRIVATE arn::core)
+    add_test(NAME arn_core_http_interrupt COMMAND arn_core_http_interrupt_test)
+    set_tests_properties(arn_core_http_interrupt PROPERTIES TIMEOUT 300)
+
     add_executable(arn_core_tool_registry_test tests/tool_registry_test.cpp)
     target_link_libraries(arn_core_tool_registry_test PRIVATE arn::core)
     add_test(NAME arn_core_tool_registry COMMAND arn_core_tool_registry_test)
@@ -224,6 +207,7 @@ if (BUILD_TESTING)
             arn_core_agent_registry_test
             arn_core_agent_orchestrator_test
             arn_core_agent_data_test arn_core_sse_test arn_core_retry_test
+            arn_core_http_interrupt_test
             arn_core_tool_registry_test arn_core_provider_test
             arn_core_agent_session_test arn_core_openrouter_test
             arn_core_omniroute_test)
@@ -275,6 +259,7 @@ if (BUILD_TESTING)
         target_compile_options(arn_core_agent_data_test PRIVATE /utf-8)
         target_compile_options(arn_core_sse_test PRIVATE /utf-8)
         target_compile_options(arn_core_retry_test PRIVATE /utf-8)
+        target_compile_options(arn_core_http_interrupt_test PRIVATE /utf-8)
         target_compile_options(arn_core_tool_registry_test PRIVATE /utf-8)
         target_compile_options(arn_core_provider_test PRIVATE /utf-8)
         target_compile_options(arn_core_agent_session_test PRIVATE /utf-8)

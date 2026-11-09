@@ -1,0 +1,538 @@
+diff --git a/httplib.h b/httplib.h
+index 704d015..c713c01 100644
+--- a/httplib.h
++++ b/httplib.h
+@@ -10,6 +10,12 @@
+ 
+ #define CPPHTTPLIB_VERSION "0.18.3"
+ 
++/*
++ * ARN patch: per-request cancellation (Request::interrupt). Consumers check
++ * this marker so an unpatched httplib.h can never be used by mistake.
++ */
++#define CPPHTTPLIB_ARN_INTERRUPT_PATCH 1
++
+ /*
+  * Configuration
+  */
+@@ -50,6 +56,10 @@
+ #define CPPHTTPLIB_SERVER_WRITE_TIMEOUT_USECOND 0
+ #endif
+ 
++#ifndef CPPHTTPLIB_INTERRUPT_CHECK_INTERVAL_USECOND
++#define CPPHTTPLIB_INTERRUPT_CHECK_INTERVAL_USECOND 50000
++#endif
++
+ #ifndef CPPHTTPLIB_CLIENT_READ_TIMEOUT_SECOND
+ #define CPPHTTPLIB_CLIENT_READ_TIMEOUT_SECOND 300
+ #endif
+@@ -633,6 +643,10 @@ struct Request {
+   ResponseHandler response_handler;
+   ContentReceiverWithProgress content_receiver;
+   Progress progress;
++  // ARN patch: optional cancellation token owned by the caller. httplib only
++  // reads it and never resets it. Once it is true the request stops as soon
++  // as possible and fails with Error::Canceled. The flag must outlive send().
++  const std::atomic<bool> *interrupt = nullptr;
+ #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+   const SSL *ssl = nullptr;
+ #endif
+@@ -1508,6 +1522,11 @@ protected:
+   std::thread::id socket_requests_are_from_thread_ = std::thread::id();
+   bool socket_should_be_closed_when_request_is_done_ = false;
+ 
++  // ARN patch: Request::interrupt of the send() running on this client. Set
++  // and restored by send_() on the request thread (under request_mutex_) and
++  // only read by that thread, so it needs no further synchronization.
++  const std::atomic<bool> *interrupt_ = nullptr;
++
+   // Hostname-IP map
+   std::map<std::string, std::string> addr_map_;
+ 
+@@ -2318,6 +2337,7 @@ void split(const char *b, const char *e, char d, size_t m,
+ bool process_client_socket(socket_t sock, time_t read_timeout_sec,
+                            time_t read_timeout_usec, time_t write_timeout_sec,
+                            time_t write_timeout_usec,
++                           const std::atomic<bool> *interrupt,
+                            std::function<bool(Stream &)> callback);
+ 
+ socket_t create_client_socket(const std::string &host, const std::string &ip,
+@@ -2328,7 +2348,8 @@ socket_t create_client_socket(const std::string &host, const std::string &ip,
+                               time_t read_timeout_sec, time_t read_timeout_usec,
+                               time_t write_timeout_sec,
+                               time_t write_timeout_usec,
+-                              const std::string &intf, Error &error);
++                              const std::string &intf, Error &error,
++                              const std::atomic<bool> *interrupt = nullptr);
+ 
+ const char *get_header_value(const Headers &headers, const std::string &key,
+                              const char *def, size_t id);
+@@ -3102,6 +3123,47 @@ inline ssize_t send_socket(socket_t sock, const void *ptr, size_t size,
+   });
+ }
+ 
++// ARN patch: cancellation support for client socket waits.
++inline bool is_interrupted(const std::atomic<bool> *interrupt) {
++  return interrupt && interrupt->load(std::memory_order_acquire);
++}
++
++// Runs `wait(sec, usec)` (a select/poll style wait returning > 0 when ready,
++// 0 on timeout and < 0 on error) and returns -1 once `interrupt` is set.
++// The token is checked before waiting, so a cancellation that arrived
++// between two waits is never lost.
++// On Windows, shutdown() from another thread does not wake a blocked
++// select()/WSAPoll(), so the wait runs in short slices up to the same total
++// timeout. Elsewhere it is one wait, which ClientImpl::stop() can wake.
++template <typename Wait>
++inline ssize_t wait_interruptible(time_t sec, time_t usec,
++                                  const std::atomic<bool> *interrupt,
++                                  Wait wait) {
++  if (!interrupt) { return static_cast<ssize_t>(wait(sec, usec)); }
++  if (is_interrupted(interrupt)) { return -1; }
++#ifdef _WIN32
++  using namespace std::chrono;
++  const auto deadline = steady_clock::now() + seconds(sec) + microseconds(usec);
++  const auto interval =
++      microseconds(CPPHTTPLIB_INTERRUPT_CHECK_INTERVAL_USECOND);
++  for (;;) {
++    auto left = duration_cast<microseconds>(deadline - steady_clock::now());
++    if (left.count() < 0) { left = microseconds(0); }
++    const auto slice = (std::min)(left, interval);
++    const auto res = static_cast<ssize_t>(
++        wait(static_cast<time_t>(slice.count() / 1000000),
++             static_cast<time_t>(slice.count() % 1000000)));
++    if (is_interrupted(interrupt)) { return -1; }
++    if (res != 0) { return res; }
++    if (steady_clock::now() >= deadline) { return 0; }
++  }
++#else
++  const auto res = static_cast<ssize_t>(wait(sec, usec));
++  if (is_interrupted(interrupt)) { return -1; }
++  return res;
++#endif
++}
++
+ inline ssize_t select_read(socket_t sock, time_t sec, time_t usec) {
+ #ifdef CPPHTTPLIB_USE_POLL
+   struct pollfd pfd_read;
+@@ -3158,17 +3220,22 @@ inline ssize_t select_write(socket_t sock, time_t sec, time_t usec) {
+ #endif
+ }
+ 
+-inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
+-                                        time_t usec) {
++inline Error
++wait_until_socket_is_ready(socket_t sock, time_t sec, time_t usec,
++                           const std::atomic<bool> *interrupt = nullptr) {
+ #ifdef CPPHTTPLIB_USE_POLL
+   struct pollfd pfd_read;
+   pfd_read.fd = sock;
+   pfd_read.events = POLLIN | POLLOUT;
+ 
+-  auto timeout = static_cast<int>(sec * 1000 + usec / 1000);
+-
+-  auto poll_res = handle_EINTR([&]() { return poll(&pfd_read, 1, timeout); });
++  auto poll_res = wait_interruptible(
++      sec, usec, interrupt, [&](time_t wait_sec, time_t wait_usec) {
++        pfd_read.revents = 0;
++        auto timeout = static_cast<int>(wait_sec * 1000 + wait_usec / 1000);
++        return handle_EINTR([&]() { return poll(&pfd_read, 1, timeout); });
++      });
+ 
++  if (is_interrupted(interrupt)) { return Error::Canceled; }
+   if (poll_res == 0) { return Error::ConnectionTimeout; }
+ 
+   if (poll_res > 0 && pfd_read.revents & (POLLIN | POLLOUT)) {
+@@ -3187,20 +3254,27 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
+ #endif
+ 
+   fd_set fdsr;
+-  FD_ZERO(&fdsr);
+-  FD_SET(sock, &fdsr);
++  fd_set fdsw;
++  fd_set fdse;
+ 
+-  auto fdsw = fdsr;
+-  auto fdse = fdsr;
++  // select() modifies the sets, so they are rebuilt for every wait slice.
++  auto ret = wait_interruptible(
++      sec, usec, interrupt, [&](time_t wait_sec, time_t wait_usec) {
++        FD_ZERO(&fdsr);
++        FD_SET(sock, &fdsr);
++        fdsw = fdsr;
++        fdse = fdsr;
+ 
+-  timeval tv;
+-  tv.tv_sec = static_cast<long>(sec);
+-  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(usec);
++        timeval tv;
++        tv.tv_sec = static_cast<long>(wait_sec);
++        tv.tv_usec = static_cast<decltype(tv.tv_usec)>(wait_usec);
+ 
+-  auto ret = handle_EINTR([&]() {
+-    return select(static_cast<int>(sock + 1), &fdsr, &fdsw, &fdse, &tv);
+-  });
++        return handle_EINTR([&]() {
++          return select(static_cast<int>(sock + 1), &fdsr, &fdsw, &fdse, &tv);
++        });
++      });
+ 
++  if (is_interrupted(interrupt)) { return Error::Canceled; }
+   if (ret == 0) { return Error::ConnectionTimeout; }
+ 
+   if (ret > 0 && (FD_ISSET(sock, &fdsr) || FD_ISSET(sock, &fdsw))) {
+@@ -3229,7 +3303,8 @@ inline bool is_socket_alive(socket_t sock) {
+ class SocketStream final : public Stream {
+ public:
+   SocketStream(socket_t sock, time_t read_timeout_sec, time_t read_timeout_usec,
+-               time_t write_timeout_sec, time_t write_timeout_usec);
++               time_t write_timeout_sec, time_t write_timeout_usec,
++               const std::atomic<bool> *interrupt = nullptr);
+   ~SocketStream() override;
+ 
+   bool is_readable() const override;
+@@ -3247,6 +3322,8 @@ private:
+   time_t write_timeout_sec_;
+   time_t write_timeout_usec_;
+ 
++  const std::atomic<bool> *interrupt_ = nullptr;
++
+   std::vector<char> read_buff_;
+   size_t read_buff_off_ = 0;
+   size_t read_buff_content_size_ = 0;
+@@ -3259,7 +3336,8 @@ class SSLSocketStream final : public Stream {
+ public:
+   SSLSocketStream(socket_t sock, SSL *ssl, time_t read_timeout_sec,
+                   time_t read_timeout_usec, time_t write_timeout_sec,
+-                  time_t write_timeout_usec);
++                  time_t write_timeout_usec,
++                  const std::atomic<bool> *interrupt = nullptr);
+   ~SSLSocketStream() override;
+ 
+   bool is_readable() const override;
+@@ -3277,6 +3355,7 @@ private:
+   time_t read_timeout_usec_;
+   time_t write_timeout_sec_;
+   time_t write_timeout_usec_;
++  const std::atomic<bool> *interrupt_ = nullptr;
+ };
+ #endif
+ 
+@@ -3351,9 +3430,10 @@ inline bool process_client_socket(socket_t sock, time_t read_timeout_sec,
+                                   time_t read_timeout_usec,
+                                   time_t write_timeout_sec,
+                                   time_t write_timeout_usec,
++                                  const std::atomic<bool> *interrupt,
+                                   std::function<bool(Stream &)> callback) {
+   SocketStream strm(sock, read_timeout_sec, read_timeout_usec,
+-                    write_timeout_sec, write_timeout_usec);
++                    write_timeout_sec, write_timeout_usec, interrupt);
+   return callback(strm);
+ }
+ 
+@@ -3627,11 +3707,18 @@ inline socket_t create_client_socket(
+     SocketOptions socket_options, time_t connection_timeout_sec,
+     time_t connection_timeout_usec, time_t read_timeout_sec,
+     time_t read_timeout_usec, time_t write_timeout_sec,
+-    time_t write_timeout_usec, const std::string &intf, Error &error) {
++    time_t write_timeout_usec, const std::string &intf, Error &error,
++    const std::atomic<bool> *interrupt) {
+   auto sock = create_socket(
+       host, ip, port, address_family, 0, tcp_nodelay, ipv6_v6only,
+       std::move(socket_options),
+       [&](socket_t sock2, struct addrinfo &ai, bool &quit) -> bool {
++        if (is_interrupted(interrupt)) {
++          error = Error::Canceled;
++          quit = true;
++          return false;
++        }
++
+         if (!intf.empty()) {
+ #ifdef USE_IF2IP
+           auto ip_from_if = if2ip(address_family, intf);
+@@ -3654,9 +3741,13 @@ inline socket_t create_client_socket(
+             return false;
+           }
+           error = wait_until_socket_is_ready(sock2, connection_timeout_sec,
+-                                             connection_timeout_usec);
++                                             connection_timeout_usec,
++                                             interrupt);
+           if (error != Error::Success) {
+-            if (error == Error::ConnectionTimeout) { quit = true; }
++            if (error == Error::ConnectionTimeout ||
++                error == Error::Canceled) {
++              quit = true;
++            }
+             return false;
+           }
+         }
+@@ -5865,20 +5956,29 @@ namespace detail {
+ inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
+                                   time_t read_timeout_usec,
+                                   time_t write_timeout_sec,
+-                                  time_t write_timeout_usec)
++                                  time_t write_timeout_usec,
++                                  const std::atomic<bool> *interrupt)
+     : sock_(sock), read_timeout_sec_(read_timeout_sec),
+       read_timeout_usec_(read_timeout_usec),
+       write_timeout_sec_(write_timeout_sec),
+-      write_timeout_usec_(write_timeout_usec), read_buff_(read_buff_size_, 0) {}
++      write_timeout_usec_(write_timeout_usec), interrupt_(interrupt),
++      read_buff_(read_buff_size_, 0) {}
+ 
+ inline SocketStream::~SocketStream() = default;
+ 
+ inline bool SocketStream::is_readable() const {
+-  return select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0;
++  return wait_interruptible(read_timeout_sec_, read_timeout_usec_, interrupt_,
++                            [&](time_t sec, time_t usec) {
++                              return select_read(sock_, sec, usec);
++                            }) > 0;
+ }
+ 
+ inline bool SocketStream::is_writable() const {
+-  return select_write(sock_, write_timeout_sec_, write_timeout_usec_) > 0 &&
++  return wait_interruptible(write_timeout_sec_, write_timeout_usec_,
++                            interrupt_,
++                            [&](time_t sec, time_t usec) {
++                              return select_write(sock_, sec, usec);
++                            }) > 0 &&
+          is_socket_alive(sock_);
+ }
+ 
+@@ -7315,7 +7415,8 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
+         proxy_host_, std::string(), proxy_port_, address_family_, tcp_nodelay_,
+         ipv6_v6only_, socket_options_, connection_timeout_sec_,
+         connection_timeout_usec_, read_timeout_sec_, read_timeout_usec_,
+-        write_timeout_sec_, write_timeout_usec_, interface_, error);
++        write_timeout_sec_, write_timeout_usec_, interface_, error,
++        interrupt_);
+   }
+ 
+   // Check is custom IP specified for host_
+@@ -7327,7 +7428,7 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
+       host_, ip, port_, address_family_, tcp_nodelay_, ipv6_v6only_,
+       socket_options_, connection_timeout_sec_, connection_timeout_usec_,
+       read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
+-      write_timeout_usec_, interface_, error);
++      write_timeout_usec_, interface_, error, interrupt_);
+ }
+ 
+ inline bool ClientImpl::create_and_connect_socket(Socket &socket,
+@@ -7425,6 +7526,20 @@ inline bool ClientImpl::is_ssl_peer_could_be_closed(SSL *ssl) const {
+ #endif
+ 
+ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
++  // ARN patch: a cancellation requested before this call must not be lost, so
++  // check it before touching the connection.
++  if (detail::is_interrupted(req.interrupt)) {
++    error = Error::Canceled;
++    return false;
++  }
++
++  // The token belongs to this call only. Restore the previous one on exit
++  // (nested send() for redirects and digest authentication).
++  const auto previous_interrupt = interrupt_;
++  interrupt_ = req.interrupt;
++  auto restore_interrupt =
++      detail::scope_exit([&]() { interrupt_ = previous_interrupt; });
++
+   {
+     std::lock_guard<std::mutex> guard(socket_mutex_);
+ 
+@@ -7457,7 +7572,10 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+     }
+ 
+     if (!is_alive) {
+-      if (!create_and_connect_socket(socket_, error)) { return false; }
++      if (!create_and_connect_socket(socket_, error)) {
++        if (detail::is_interrupted(req.interrupt)) { error = Error::Canceled; }
++        return false;
++      }
+ 
+ #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+       // TODO: refactoring
+@@ -7466,15 +7584,30 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+         if (!proxy_host_.empty() && proxy_port_ != -1) {
+           auto success = false;
+           if (!scli.connect_with_proxy(socket_, res, success, error)) {
++            if (!success && detail::is_interrupted(req.interrupt)) {
++              error = Error::Canceled;
++            }
+             return success;
+           }
+         }
+ 
+-        if (!scli.initialize_ssl(socket_, error)) { return false; }
++        if (!scli.initialize_ssl(socket_, error)) {
++          if (detail::is_interrupted(req.interrupt)) {
++            error = Error::Canceled;
++          }
++          return false;
++        }
+       }
+ #endif
+     }
+ 
++    // ARN patch: the cancellation may have arrived while connecting. The
++    // connection is left idle and intact, so it can still be reused.
++    if (detail::is_interrupted(req.interrupt)) {
++      error = Error::Canceled;
++      return false;
++    }
++
+     // Mark the current socket as being in use so that it cannot be closed by
+     // anyone else while this request is ongoing, even though we will be
+     // releasing the mutex.
+@@ -7505,7 +7638,9 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+ 
+     if (socket_should_be_closed_when_request_is_done_ || close_connection ||
+         !ret) {
+-      shutdown_ssl(socket_, true);
++      // ARN patch: an interrupted request does not wait for the peer's TLS
++      // close_notify (up to about a second on POSIX).
++      shutdown_ssl(socket_, !detail::is_interrupted(req.interrupt));
+       shutdown_socket(socket_);
+       close_socket(socket_);
+     }
+@@ -7517,6 +7652,9 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+ 
+   if (!ret) {
+     if (error == Error::Success) { error = Error::Unknown; }
++    // ARN patch: report an interrupted request as cancelled, whatever read or
++    // write error the interruption caused.
++    if (detail::is_interrupted(req.interrupt)) { error = Error::Canceled; }
+   }
+ 
+   return ret;
+@@ -8076,7 +8214,7 @@ ClientImpl::process_socket(const Socket &socket,
+                            std::function<bool(Stream &strm)> callback) {
+   return detail::process_client_socket(
+       socket.sock, read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
+-      write_timeout_usec_, std::move(callback));
++      write_timeout_usec_, interrupt_, std::move(callback));
+ }
+ 
+ inline bool ClientImpl::is_ssl() const { return false; }
+@@ -8927,19 +9065,28 @@ inline void ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
+ }
+ 
+ template <typename U>
+-bool ssl_connect_or_accept_nonblocking(socket_t sock, SSL *ssl,
+-                                       U ssl_connect_or_accept,
+-                                       time_t timeout_sec,
+-                                       time_t timeout_usec) {
++bool ssl_connect_or_accept_nonblocking(
++    socket_t sock, SSL *ssl, U ssl_connect_or_accept, time_t timeout_sec,
++    time_t timeout_usec, const std::atomic<bool> *interrupt = nullptr) {
+   auto res = 0;
+   while ((res = ssl_connect_or_accept(ssl)) != 1) {
+     auto err = SSL_get_error(ssl, res);
+     switch (err) {
+     case SSL_ERROR_WANT_READ:
+-      if (select_read(sock, timeout_sec, timeout_usec) > 0) { continue; }
++      if (wait_interruptible(timeout_sec, timeout_usec, interrupt,
++                             [&](time_t sec, time_t usec) {
++                               return select_read(sock, sec, usec);
++                             }) > 0) {
++        continue;
++      }
+       break;
+     case SSL_ERROR_WANT_WRITE:
+-      if (select_write(sock, timeout_sec, timeout_usec) > 0) { continue; }
++      if (wait_interruptible(timeout_sec, timeout_usec, interrupt,
++                             [&](time_t sec, time_t usec) {
++                               return select_write(sock, sec, usec);
++                             }) > 0) {
++        continue;
++      }
+       break;
+     default: break;
+     }
+@@ -8967,9 +9114,10 @@ template <typename T>
+ inline bool
+ process_client_socket_ssl(SSL *ssl, socket_t sock, time_t read_timeout_sec,
+                           time_t read_timeout_usec, time_t write_timeout_sec,
+-                          time_t write_timeout_usec, T callback) {
++                          time_t write_timeout_usec,
++                          const std::atomic<bool> *interrupt, T callback) {
+   SSLSocketStream strm(sock, ssl, read_timeout_sec, read_timeout_usec,
+-                       write_timeout_sec, write_timeout_usec);
++                       write_timeout_sec, write_timeout_usec, interrupt);
+   return callback(strm);
+ }
+ 
+@@ -8986,22 +9134,30 @@ inline SSLSocketStream::SSLSocketStream(socket_t sock, SSL *ssl,
+                                         time_t read_timeout_sec,
+                                         time_t read_timeout_usec,
+                                         time_t write_timeout_sec,
+-                                        time_t write_timeout_usec)
++                                        time_t write_timeout_usec,
++                                        const std::atomic<bool> *interrupt)
+     : sock_(sock), ssl_(ssl), read_timeout_sec_(read_timeout_sec),
+       read_timeout_usec_(read_timeout_usec),
+       write_timeout_sec_(write_timeout_sec),
+-      write_timeout_usec_(write_timeout_usec) {
++      write_timeout_usec_(write_timeout_usec), interrupt_(interrupt) {
+   SSL_clear_mode(ssl, SSL_MODE_AUTO_RETRY);
+ }
+ 
+ inline SSLSocketStream::~SSLSocketStream() = default;
+ 
+ inline bool SSLSocketStream::is_readable() const {
+-  return detail::select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0;
++  return wait_interruptible(read_timeout_sec_, read_timeout_usec_, interrupt_,
++                            [&](time_t sec, time_t usec) {
++                              return detail::select_read(sock_, sec, usec);
++                            }) > 0;
+ }
+ 
+ inline bool SSLSocketStream::is_writable() const {
+-  return select_write(sock_, write_timeout_sec_, write_timeout_usec_) > 0 &&
++  return wait_interruptible(write_timeout_sec_, write_timeout_usec_,
++                            interrupt_,
++                            [&](time_t sec, time_t usec) {
++                              return select_write(sock_, sec, usec);
++                            }) > 0 &&
+          is_socket_alive(sock_);
+ }
+ 
+@@ -9326,7 +9482,8 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
+   Response proxy_res;
+   if (!detail::process_client_socket(
+           socket.sock, read_timeout_sec_, read_timeout_usec_,
+-          write_timeout_sec_, write_timeout_usec_, [&](Stream &strm) {
++          write_timeout_sec_, write_timeout_usec_, interrupt_,
++          [&](Stream &strm) {
+             Request req2;
+             req2.method = "CONNECT";
+             req2.path = host_and_port_;
+@@ -9349,7 +9506,8 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
+         proxy_res = Response();
+         if (!detail::process_client_socket(
+                 socket.sock, read_timeout_sec_, read_timeout_usec_,
+-                write_timeout_sec_, write_timeout_usec_, [&](Stream &strm) {
++                write_timeout_sec_, write_timeout_usec_, interrupt_,
++                [&](Stream &strm) {
+                   Request req3;
+                   req3.method = "CONNECT";
+                   req3.path = host_and_port_;
+@@ -9434,7 +9592,7 @@ inline bool SSLClient::initialize_ssl(Socket &socket, Error &error) {
+ 
+         if (!detail::ssl_connect_or_accept_nonblocking(
+                 socket.sock, ssl2, SSL_connect, connection_timeout_sec_,
+-                connection_timeout_usec_)) {
++                connection_timeout_usec_, interrupt_)) {
+           error = Error::SSLConnection;
+           return false;
+         }
+@@ -9518,7 +9676,8 @@ SSLClient::process_socket(const Socket &socket,
+   assert(socket.ssl);
+   return detail::process_client_socket_ssl(
+       socket.ssl, socket.sock, read_timeout_sec_, read_timeout_usec_,
+-      write_timeout_sec_, write_timeout_usec_, std::move(callback));
++      write_timeout_sec_, write_timeout_usec_, interrupt_,
++      std::move(callback));
+ }
+ 
+ inline bool SSLClient::is_ssl() const { return true; }

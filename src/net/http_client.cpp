@@ -83,6 +83,10 @@ httplib::Result stream_post(httplib::Client& client, const std::string& path,
         json_response = type == "application/json" || type.ends_with("+json");
         return true;
     };
+    // httplib checks the same flag while connecting and before every socket
+    // wait, so a cancellation also ends a request that receives no data. The
+    // flag is owned by the caller's operation and outlives this call.
+    request.interrupt = cancel_requested;
     request.progress = [cancel_requested](std::uint64_t, std::uint64_t) {
         return !cancel_requested || !cancel_requested->load(std::memory_order_relaxed);
     };

@@ -14,6 +14,14 @@
 
 #include <httplib.h>
 
+// arn-core passes its cancellation token to httplib as Request::interrupt, which
+// only its patched cpp-httplib 0.18.3 has (cmake/ArnCoreHttplib.cmake). Any
+// other httplib.h found first would also change the httplib::Request layout
+// between translation units, so refuse to build instead.
+#if !defined(CPPHTTPLIB_ARN_INTERRUPT_PATCH) || CPPHTTPLIB_ARN_INTERRUPT_PATCH != 1
+#error "arn-core requires its patched cpp-httplib (CPPHTTPLIB_ARN_INTERRUPT_PATCH); another httplib.h was found first"
+#endif
+
 namespace arn::core::net {
 
 /// Default maximum number of attempts for transient HTTP requests.
@@ -152,7 +160,9 @@ auto execute_stream_with_retry(RequestFn&& request, const bool& received_event,
  * @param on_event Callback receiving decoded SSE events.
  * @param error_body Output string populated with server error body if status is not 2xx.
  * @param received_event Output flag set to true once at least one event is parsed.
- * @param cancel_requested Optional cancellation token.
+ * @param cancel_requested Optional cancellation token, also passed to httplib as
+ *        Request::interrupt. Once set, the request ends with
+ *        httplib::Error::Canceled. It must outlive the call and is never reset.
  * @return httplib::Result indicating outcome.
  */
 httplib::Result stream_post(httplib::Client& client, const std::string& path,
