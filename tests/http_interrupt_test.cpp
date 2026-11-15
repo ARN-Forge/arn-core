@@ -4,9 +4,9 @@
 // Everything runs against local servers on 127.0.0.1; nothing needs network
 // access. The TLS certificate is generated in memory.
 //
-// On Windows a blocked socket wait notices the token by itself (50 ms slices).
-// On Linux and macOS a blocked wait is woken by stop(), as before; the token is
-// still checked before and after every wait on all platforms.
+// A blocked socket wait notices the token by itself (50 ms slices) on every
+// platform with patch level 2; stop() is not needed. With level 1 that held on
+// Windows only, and on Linux and macOS a blocked wait was woken by stop().
 
 #include "arn/core/net/http_client.hpp"
 
@@ -36,7 +36,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
-#ifdef _WIN32
+#if defined(_WIN32) ||     (defined(CPPHTTPLIB_ARN_INTERRUPT_PATCH_LEVEL) && CPPHTTPLIB_ARN_INTERRUPT_PATCH_LEVEL >= 2)
 constexpr bool sliced_waits = true;
 #else
 constexpr bool sliced_waits = false;
@@ -353,7 +353,7 @@ void blocked_wait(bool tls, bool mid_stream, bool with_stop) {
     if (with_stop) client->stop();
     const auto result = finish(done, name);
     const double elapsed = ms_since(start);
-    record(with_stop ? "blocked wait, token + stop()" : "blocked wait, token only (Windows)", elapsed);
+    record(with_stop ? "blocked wait, token + stop()" : "blocked wait, token only", elapsed);
     check(canceled(result), name + ": expected Canceled, got " + error_text(result));
     check(elapsed <= prompt_limit_ms, name + ": took " + fmt_ms(elapsed));
 }
@@ -462,9 +462,10 @@ void connect_wait_windows() {
 #endif
 
 // 7: the server accepts TCP but never answers the TLS ClientHello.
-// Windows: the handshake wait notices the token. POSIX: the handshake runs
-// under httplib's socket mutex, so stop() cannot reach it and the wait ends at
-// the connection timeout (2 s here), still reported as Canceled.
+// With sliced waits the handshake wait notices the token. Without them
+// (patch level 1 on POSIX) the handshake runs under httplib's socket mutex, so
+// stop() cannot reach it and the wait ends at the connection timeout (2 s
+// here), still reported as Canceled.
 void during_tls_handshake() {
     const std::string name = "TLS handshake";
     RawListener listener;
@@ -483,7 +484,7 @@ void during_tls_handshake() {
     const double elapsed = ms_since(start);
     check(canceled(result), name + ": expected Canceled, got " + error_text(result));
     if (sliced_waits) {
-        record("TLS handshake (Windows)", elapsed);
+        record("TLS handshake", elapsed);
         check(elapsed <= prompt_limit_ms, name + ": took " + fmt_ms(elapsed));
     } else {
         record("TLS handshake (POSIX, ends at 2 s connection timeout)", elapsed);
@@ -811,7 +812,7 @@ int main() {
         return 1;
     }
 
-    std::cout << "Waits: " << (sliced_waits ? "50 ms slices (Windows)" : "single wait, stop() wakes it")
+    std::cout << "Waits: " << (sliced_waits ? "50 ms slices" : "single wait, stop() wakes it")
               << "\nSlowest result per case:\n";
     for (const auto& [category, value] : worst_ms)
         std::cout << "  " << std::left << std::setw(56) << category << fmt_ms(value) << '\n';

@@ -174,6 +174,13 @@ if (BUILD_TESTING)
     add_test(NAME arn_core_http_interrupt COMMAND arn_core_http_interrupt_test)
     set_tests_properties(arn_core_http_interrupt PROPERTIES TIMEOUT 300)
 
+    # Token-only cancellation of requests to servers that stall inside a TLS
+    # record, stop reading, or resolve slowly; local servers only.
+    add_executable(arn_core_http_stall_test tests/http_stall_test.cpp)
+    target_link_libraries(arn_core_http_stall_test PRIVATE arn::core)
+    add_test(NAME arn_core_http_stall COMMAND arn_core_http_stall_test)
+    set_tests_properties(arn_core_http_stall PROPERTIES TIMEOUT 300)
+
     add_executable(arn_core_tool_registry_test tests/tool_registry_test.cpp)
     target_link_libraries(arn_core_tool_registry_test PRIVATE arn::core)
     add_test(NAME arn_core_tool_registry COMMAND arn_core_tool_registry_test)
@@ -207,7 +214,7 @@ if (BUILD_TESTING)
             arn_core_agent_registry_test
             arn_core_agent_orchestrator_test
             arn_core_agent_data_test arn_core_sse_test arn_core_retry_test
-            arn_core_http_interrupt_test
+            arn_core_http_interrupt_test arn_core_http_stall_test
             arn_core_tool_registry_test arn_core_provider_test
             arn_core_agent_session_test arn_core_openrouter_test
             arn_core_omniroute_test)
@@ -260,6 +267,7 @@ if (BUILD_TESTING)
         target_compile_options(arn_core_sse_test PRIVATE /utf-8)
         target_compile_options(arn_core_retry_test PRIVATE /utf-8)
         target_compile_options(arn_core_http_interrupt_test PRIVATE /utf-8)
+        target_compile_options(arn_core_http_stall_test PRIVATE /utf-8)
         target_compile_options(arn_core_tool_registry_test PRIVATE /utf-8)
         target_compile_options(arn_core_provider_test PRIVATE /utf-8)
         target_compile_options(arn_core_agent_session_test PRIVATE /utf-8)

@@ -1,21 +1,24 @@
 diff --git a/httplib.h b/httplib.h
-index 704d015..c713c01 100644
+index 704d015..b581ba4 100644
 --- a/httplib.h
 +++ b/httplib.h
-@@ -10,6 +10,12 @@
+@@ -10,6 +10,15 @@
  
  #define CPPHTTPLIB_VERSION "0.18.3"
  
 +/*
 + * ARN patch: per-request cancellation (Request::interrupt). Consumers check
 + * this marker so an unpatched httplib.h can never be used by mistake.
++ * Level 2: client socket I/O with a token is non-blocking (TLS included),
++ * every wait is sliced on all platforms, and name lookups are interruptible.
 + */
 +#define CPPHTTPLIB_ARN_INTERRUPT_PATCH 1
++#define CPPHTTPLIB_ARN_INTERRUPT_PATCH_LEVEL 2
 +
  /*
   * Configuration
   */
-@@ -50,6 +56,10 @@
+@@ -50,6 +59,10 @@
  #define CPPHTTPLIB_SERVER_WRITE_TIMEOUT_USECOND 0
  #endif
  
@@ -26,7 +29,7 @@ index 704d015..c713c01 100644
  #ifndef CPPHTTPLIB_CLIENT_READ_TIMEOUT_SECOND
  #define CPPHTTPLIB_CLIENT_READ_TIMEOUT_SECOND 300
  #endif
-@@ -633,6 +643,10 @@ struct Request {
+@@ -633,6 +646,10 @@ struct Request {
    ResponseHandler response_handler;
    ContentReceiverWithProgress content_receiver;
    Progress progress;
@@ -37,7 +40,7 @@ index 704d015..c713c01 100644
  #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
    const SSL *ssl = nullptr;
  #endif
-@@ -1508,6 +1522,11 @@ protected:
+@@ -1508,6 +1525,11 @@ protected:
    std::thread::id socket_requests_are_from_thread_ = std::thread::id();
    bool socket_should_be_closed_when_request_is_done_ = false;
  
@@ -49,7 +52,7 @@ index 704d015..c713c01 100644
    // Hostname-IP map
    std::map<std::string, std::string> addr_map_;
  
-@@ -2318,6 +2337,7 @@ void split(const char *b, const char *e, char d, size_t m,
+@@ -2318,6 +2340,7 @@ void split(const char *b, const char *e, char d, size_t m,
  bool process_client_socket(socket_t sock, time_t read_timeout_sec,
                             time_t read_timeout_usec, time_t write_timeout_sec,
                             time_t write_timeout_usec,
@@ -57,7 +60,7 @@ index 704d015..c713c01 100644
                             std::function<bool(Stream &)> callback);
  
  socket_t create_client_socket(const std::string &host, const std::string &ip,
-@@ -2328,7 +2348,8 @@ socket_t create_client_socket(const std::string &host, const std::string &ip,
+@@ -2328,7 +2351,8 @@ socket_t create_client_socket(const std::string &host, const std::string &ip,
                                time_t read_timeout_sec, time_t read_timeout_usec,
                                time_t write_timeout_sec,
                                time_t write_timeout_usec,
@@ -67,7 +70,7 @@ index 704d015..c713c01 100644
  
  const char *get_header_value(const Headers &headers, const std::string &key,
                               const char *def, size_t id);
-@@ -3102,6 +3123,47 @@ inline ssize_t send_socket(socket_t sock, const void *ptr, size_t size,
+@@ -3102,6 +3126,129 @@ inline ssize_t send_socket(socket_t sock, const void *ptr, size_t size,
    });
  }
  
@@ -80,16 +83,16 @@ index 704d015..c713c01 100644
 +// 0 on timeout and < 0 on error) and returns -1 once `interrupt` is set.
 +// The token is checked before waiting, so a cancellation that arrived
 +// between two waits is never lost.
-+// On Windows, shutdown() from another thread does not wake a blocked
-+// select()/WSAPoll(), so the wait runs in short slices up to the same total
-+// timeout. Elsewhere it is one wait, which ClientImpl::stop() can wake.
++// The wait runs in short slices up to the same total timeout, so the token
++// alone ends it on every platform. On Windows, shutdown() from another thread
++// wakes neither a blocked select()/WSAPoll() nor a blocking recv(), so
++// ClientImpl::stop() can never be relied on there.
 +template <typename Wait>
 +inline ssize_t wait_interruptible(time_t sec, time_t usec,
 +                                  const std::atomic<bool> *interrupt,
 +                                  Wait wait) {
 +  if (!interrupt) { return static_cast<ssize_t>(wait(sec, usec)); }
 +  if (is_interrupted(interrupt)) { return -1; }
-+#ifdef _WIN32
 +  using namespace std::chrono;
 +  const auto deadline = steady_clock::now() + seconds(sec) + microseconds(usec);
 +  const auto interval =
@@ -105,17 +108,99 @@ index 704d015..c713c01 100644
 +    if (res != 0) { return res; }
 +    if (steady_clock::now() >= deadline) { return 0; }
 +  }
++}
++
++// ARN patch: true when the last socket call failed only because a
++// non-blocking socket was not ready.
++inline bool is_would_block() {
++#ifdef _WIN32
++  return WSAGetLastError() == WSAEWOULDBLOCK;
 +#else
-+  const auto res = static_cast<ssize_t>(wait(sec, usec));
-+  if (is_interrupted(interrupt)) { return -1; }
-+  return res;
++  return errno == EAGAIN || errno == EWOULDBLOCK;
 +#endif
++}
++
++// ARN patch: getaddrinfo() cannot be interrupted. With a token, `resolve`
++// (getaddrinfo or a test double) runs on a helper thread while this thread
++// waits in short slices. On cancellation the lookup is abandoned: the helper
++// thread owns only the shared Lookup state and frees its own result. Without a
++// token, or if no thread can be started, it is a plain call as before.
++template <typename Resolve>
++inline int getaddrinfo_interruptible(Resolve resolve, const char *node,
++                                     const char *service,
++                                     const struct addrinfo *hints,
++                                     struct addrinfo **res,
++                                     const std::atomic<bool> *interrupt) {
++  if (!interrupt) { return resolve(node, service, hints, res); }
++  if (is_interrupted(interrupt)) { return EAI_AGAIN; }
++
++  struct Lookup {
++    std::mutex mutex;
++    std::condition_variable cv;
++    bool done = false;
++    bool abandoned = false;
++    int rc = EAI_FAIL;
++    struct addrinfo *result = nullptr;
++    bool has_node = false;
++    std::string node;
++    std::string service;
++    struct addrinfo hints;
++  };
++  auto lookup = std::make_shared<Lookup>();
++  lookup->has_node = node != nullptr;
++  if (node) { lookup->node = node; }
++  if (service) { lookup->service = service; }
++  memset(&lookup->hints, 0, sizeof(lookup->hints));
++  if (hints) { lookup->hints = *hints; }
++
++  try {
++    std::thread([lookup, resolve]() {
++      struct addrinfo *result = nullptr;
++      const auto rc =
++          resolve(lookup->has_node ? lookup->node.c_str() : nullptr,
++                  lookup->service.c_str(), &lookup->hints, &result);
++      std::lock_guard<std::mutex> guard(lookup->mutex);
++      if (lookup->abandoned) {
++        if (rc == 0 && result) { freeaddrinfo(result); }
++        return;
++      }
++      lookup->rc = rc;
++      lookup->result = rc == 0 ? result : nullptr;
++      lookup->done = true;
++      lookup->cv.notify_all();
++    }).detach();
++  } catch (const std::system_error &) {
++    return resolve(node, service, hints, res);
++  }
++
++  std::unique_lock<std::mutex> lock(lookup->mutex);
++  while (!lookup->done) {
++    if (is_interrupted(interrupt)) {
++      lookup->abandoned = true;
++      return EAI_AGAIN;
++    }
++    lookup->cv.wait_for(
++        lock,
++        std::chrono::microseconds(CPPHTTPLIB_INTERRUPT_CHECK_INTERVAL_USECOND));
++  }
++  *res = lookup->result;
++  return lookup->rc;
++}
++
++inline int getaddrinfo_interruptible(const char *node, const char *service,
++                                     const struct addrinfo *hints,
++                                     struct addrinfo **res,
++                                     const std::atomic<bool> *interrupt) {
++  return getaddrinfo_interruptible(
++      [](const char *n, const char *s, const struct addrinfo *h,
++         struct addrinfo **r) { return getaddrinfo(n, s, h, r); },
++      node, service, hints, res, interrupt);
 +}
 +
  inline ssize_t select_read(socket_t sock, time_t sec, time_t usec) {
  #ifdef CPPHTTPLIB_USE_POLL
    struct pollfd pfd_read;
-@@ -3158,17 +3220,22 @@ inline ssize_t select_write(socket_t sock, time_t sec, time_t usec) {
+@@ -3158,17 +3305,22 @@ inline ssize_t select_write(socket_t sock, time_t sec, time_t usec) {
  #endif
  }
  
@@ -143,7 +228,7 @@ index 704d015..c713c01 100644
    if (poll_res == 0) { return Error::ConnectionTimeout; }
  
    if (poll_res > 0 && pfd_read.revents & (POLLIN | POLLOUT)) {
-@@ -3187,20 +3254,27 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
+@@ -3187,20 +3339,27 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
  #endif
  
    fd_set fdsr;
@@ -181,7 +266,7 @@ index 704d015..c713c01 100644
    if (ret == 0) { return Error::ConnectionTimeout; }
  
    if (ret > 0 && (FD_ISSET(sock, &fdsr) || FD_ISSET(sock, &fdsw))) {
-@@ -3229,7 +3303,8 @@ inline bool is_socket_alive(socket_t sock) {
+@@ -3229,7 +3388,8 @@ inline bool is_socket_alive(socket_t sock) {
  class SocketStream final : public Stream {
  public:
    SocketStream(socket_t sock, time_t read_timeout_sec, time_t read_timeout_usec,
@@ -191,7 +276,7 @@ index 704d015..c713c01 100644
    ~SocketStream() override;
  
    bool is_readable() const override;
-@@ -3247,6 +3322,8 @@ private:
+@@ -3247,6 +3407,8 @@ private:
    time_t write_timeout_sec_;
    time_t write_timeout_usec_;
  
@@ -200,7 +285,7 @@ index 704d015..c713c01 100644
    std::vector<char> read_buff_;
    size_t read_buff_off_ = 0;
    size_t read_buff_content_size_ = 0;
-@@ -3259,7 +3336,8 @@ class SSLSocketStream final : public Stream {
+@@ -3259,7 +3421,8 @@ class SSLSocketStream final : public Stream {
  public:
    SSLSocketStream(socket_t sock, SSL *ssl, time_t read_timeout_sec,
                    time_t read_timeout_usec, time_t write_timeout_sec,
@@ -210,7 +295,7 @@ index 704d015..c713c01 100644
    ~SSLSocketStream() override;
  
    bool is_readable() const override;
-@@ -3277,6 +3355,7 @@ private:
+@@ -3277,6 +3440,7 @@ private:
    time_t read_timeout_usec_;
    time_t write_timeout_sec_;
    time_t write_timeout_usec_;
@@ -218,7 +303,7 @@ index 704d015..c713c01 100644
  };
  #endif
  
-@@ -3351,9 +3430,10 @@ inline bool process_client_socket(socket_t sock, time_t read_timeout_sec,
+@@ -3351,9 +3515,10 @@ inline bool process_client_socket(socket_t sock, time_t read_timeout_sec,
                                    time_t read_timeout_usec,
                                    time_t write_timeout_sec,
                                    time_t write_timeout_usec,
@@ -230,7 +315,28 @@ index 704d015..c713c01 100644
    return callback(strm);
  }
  
-@@ -3627,11 +3707,18 @@ inline socket_t create_client_socket(
+@@ -3388,7 +3553,8 @@ template <typename BindOrConnect>
+ socket_t create_socket(const std::string &host, const std::string &ip, int port,
+                        int address_family, int socket_flags, bool tcp_nodelay,
+                        bool ipv6_v6only, SocketOptions socket_options,
+-                       BindOrConnect bind_or_connect) {
++                       BindOrConnect bind_or_connect,
++                       const std::atomic<bool> *interrupt = nullptr) {
+   // Get address info
+   const char *node = nullptr;
+   struct addrinfo hints;
+@@ -3450,7 +3616,9 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
+ 
+   auto service = std::to_string(port);
+ 
+-  if (getaddrinfo(node, service.c_str(), &hints, &result)) {
++  // ARN patch: a name lookup can be cancelled with the request's token.
++  if (getaddrinfo_interruptible(node, service.c_str(), &hints, &result,
++                                interrupt)) {
+ #if defined __linux__ && !defined __ANDROID__
+     res_init();
+ #endif
+@@ -3627,11 +3795,18 @@ inline socket_t create_client_socket(
      SocketOptions socket_options, time_t connection_timeout_sec,
      time_t connection_timeout_usec, time_t read_timeout_sec,
      time_t read_timeout_usec, time_t write_timeout_sec,
@@ -250,7 +356,7 @@ index 704d015..c713c01 100644
          if (!intf.empty()) {
  #ifdef USE_IF2IP
            auto ip_from_if = if2ip(address_family, intf);
-@@ -3654,9 +3741,13 @@ inline socket_t create_client_socket(
+@@ -3654,9 +3829,13 @@ inline socket_t create_client_socket(
              return false;
            }
            error = wait_until_socket_is_ready(sock2, connection_timeout_sec,
@@ -266,7 +372,17 @@ index 704d015..c713c01 100644
              return false;
            }
          }
-@@ -5865,20 +5956,29 @@ namespace detail {
+@@ -3695,7 +3874,8 @@ inline socket_t create_client_socket(
+ 
+         error = Error::Success;
+         return true;
+-      });
++      },
++      interrupt);
+ 
+   if (sock != INVALID_SOCKET) {
+     error = Error::Success;
+@@ -5865,20 +6045,36 @@ namespace detail {
  inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
                                    time_t read_timeout_usec,
                                    time_t write_timeout_sec,
@@ -278,9 +394,17 @@ index 704d015..c713c01 100644
        write_timeout_sec_(write_timeout_sec),
 -      write_timeout_usec_(write_timeout_usec), read_buff_(read_buff_size_, 0) {}
 +      write_timeout_usec_(write_timeout_usec), interrupt_(interrupt),
-+      read_buff_(read_buff_size_, 0) {}
++      read_buff_(read_buff_size_, 0) {
++  // ARN patch: with a token, every socket call returns at once and all waiting
++  // happens in the interruptible waits below. A blocking send() could otherwise
++  // wait for the full write timeout once the peer stops reading.
++  if (interrupt_) { set_nonblocking(sock_, true); }
++}
  
- inline SocketStream::~SocketStream() = default;
+-inline SocketStream::~SocketStream() = default;
++inline SocketStream::~SocketStream() {
++  if (interrupt_) { set_nonblocking(sock_, false); }
++}
  
  inline bool SocketStream::is_readable() const {
 -  return select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0;
@@ -300,7 +424,50 @@ index 704d015..c713c01 100644
           is_socket_alive(sock_);
  }
  
-@@ -7315,7 +7415,8 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
+@@ -5912,6 +6108,12 @@ inline ssize_t SocketStream::read(char *ptr, size_t size) {
+   if (size < read_buff_size_) {
+     auto n = read_socket(sock_, read_buff_.data(), read_buff_size_,
+                          CPPHTTPLIB_RECV_FLAGS);
++    // ARN patch: a non-blocking socket may report readiness spuriously.
++    while (n < 0 && interrupt_ && is_would_block()) {
++      if (!is_readable()) { return -1; }
++      n = read_socket(sock_, read_buff_.data(), read_buff_size_,
++                      CPPHTTPLIB_RECV_FLAGS);
++    }
+     if (n <= 0) {
+       return n;
+     } else if (n <= static_cast<ssize_t>(size)) {
+@@ -5924,7 +6126,12 @@ inline ssize_t SocketStream::read(char *ptr, size_t size) {
+       return static_cast<ssize_t>(size);
+     }
+   } else {
+-    return read_socket(sock_, ptr, size, CPPHTTPLIB_RECV_FLAGS);
++    auto n = read_socket(sock_, ptr, size, CPPHTTPLIB_RECV_FLAGS);
++    while (n < 0 && interrupt_ && is_would_block()) {
++      if (!is_readable()) { return -1; }
++      n = read_socket(sock_, ptr, size, CPPHTTPLIB_RECV_FLAGS);
++    }
++    return n;
+   }
+ }
+ 
+@@ -5936,7 +6143,14 @@ inline ssize_t SocketStream::write(const char *ptr, size_t size) {
+       (std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)()));
+ #endif
+ 
+-  return send_socket(sock_, ptr, size, CPPHTTPLIB_SEND_FLAGS);
++  auto n = send_socket(sock_, ptr, size, CPPHTTPLIB_SEND_FLAGS);
++  // ARN patch: the non-blocking send buffer is full; wait (interruptibly)
++  // until it drains. A partial count is returned as usual.
++  while (n < 0 && interrupt_ && is_would_block()) {
++    if (!is_writable()) { return -1; }
++    n = send_socket(sock_, ptr, size, CPPHTTPLIB_SEND_FLAGS);
++  }
++  return n;
+ }
+ 
+ inline void SocketStream::get_remote_ip_and_port(std::string &ip,
+@@ -7315,7 +7529,8 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
          proxy_host_, std::string(), proxy_port_, address_family_, tcp_nodelay_,
          ipv6_v6only_, socket_options_, connection_timeout_sec_,
          connection_timeout_usec_, read_timeout_sec_, read_timeout_usec_,
@@ -310,7 +477,7 @@ index 704d015..c713c01 100644
    }
  
    // Check is custom IP specified for host_
-@@ -7327,7 +7428,7 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
+@@ -7327,7 +7542,7 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
        host_, ip, port_, address_family_, tcp_nodelay_, ipv6_v6only_,
        socket_options_, connection_timeout_sec_, connection_timeout_usec_,
        read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
@@ -319,7 +486,7 @@ index 704d015..c713c01 100644
  }
  
  inline bool ClientImpl::create_and_connect_socket(Socket &socket,
-@@ -7425,6 +7526,20 @@ inline bool ClientImpl::is_ssl_peer_could_be_closed(SSL *ssl) const {
+@@ -7425,6 +7640,20 @@ inline bool ClientImpl::is_ssl_peer_could_be_closed(SSL *ssl) const {
  #endif
  
  inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
@@ -340,7 +507,7 @@ index 704d015..c713c01 100644
    {
      std::lock_guard<std::mutex> guard(socket_mutex_);
  
-@@ -7457,7 +7572,10 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+@@ -7457,7 +7686,10 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
      }
  
      if (!is_alive) {
@@ -352,7 +519,7 @@ index 704d015..c713c01 100644
  
  #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
        // TODO: refactoring
-@@ -7466,15 +7584,30 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+@@ -7466,15 +7698,30 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
          if (!proxy_host_.empty() && proxy_port_ != -1) {
            auto success = false;
            if (!scli.connect_with_proxy(socket_, res, success, error)) {
@@ -384,7 +551,7 @@ index 704d015..c713c01 100644
      // Mark the current socket as being in use so that it cannot be closed by
      // anyone else while this request is ongoing, even though we will be
      // releasing the mutex.
-@@ -7505,7 +7638,9 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+@@ -7505,7 +7752,9 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
  
      if (socket_should_be_closed_when_request_is_done_ || close_connection ||
          !ret) {
@@ -395,7 +562,7 @@ index 704d015..c713c01 100644
        shutdown_socket(socket_);
        close_socket(socket_);
      }
-@@ -7517,6 +7652,9 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
+@@ -7517,6 +7766,9 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
  
    if (!ret) {
      if (error == Error::Success) { error = Error::Unknown; }
@@ -405,7 +572,7 @@ index 704d015..c713c01 100644
    }
  
    return ret;
-@@ -8076,7 +8214,7 @@ ClientImpl::process_socket(const Socket &socket,
+@@ -8076,7 +8328,7 @@ ClientImpl::process_socket(const Socket &socket,
                             std::function<bool(Stream &strm)> callback) {
    return detail::process_client_socket(
        socket.sock, read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
@@ -414,7 +581,7 @@ index 704d015..c713c01 100644
  }
  
  inline bool ClientImpl::is_ssl() const { return false; }
-@@ -8927,19 +9065,28 @@ inline void ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
+@@ -8927,19 +9179,28 @@ inline void ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
  }
  
  template <typename U>
@@ -449,7 +616,7 @@ index 704d015..c713c01 100644
        break;
      default: break;
      }
-@@ -8967,9 +9114,10 @@ template <typename T>
+@@ -8967,9 +9228,10 @@ template <typename T>
  inline bool
  process_client_socket_ssl(SSL *ssl, socket_t sock, time_t read_timeout_sec,
                            time_t read_timeout_usec, time_t write_timeout_sec,
@@ -462,7 +629,7 @@ index 704d015..c713c01 100644
    return callback(strm);
  }
  
-@@ -8986,22 +9134,30 @@ inline SSLSocketStream::SSLSocketStream(socket_t sock, SSL *ssl,
+@@ -8986,26 +9248,63 @@ inline SSLSocketStream::SSLSocketStream(socket_t sock, SSL *ssl,
                                          time_t read_timeout_sec,
                                          time_t read_timeout_usec,
                                          time_t write_timeout_sec,
@@ -475,9 +642,18 @@ index 704d015..c713c01 100644
 -      write_timeout_usec_(write_timeout_usec) {
 +      write_timeout_usec_(write_timeout_usec), interrupt_(interrupt) {
    SSL_clear_mode(ssl, SSL_MODE_AUTO_RETRY);
++  // ARN patch: with a token the socket stays non-blocking for the whole
++  // request, so SSL_read()/SSL_write() never block inside recv()/send(). A
++  // TLS record that has only partly arrived then yields SSL_ERROR_WANT_READ
++  // and the interruptible wait, instead of a recv() that only the socket
++  // timeout ends (on Windows nothing else wakes it).
++  if (interrupt_) { set_nonblocking(sock_, true); }
  }
  
- inline SSLSocketStream::~SSLSocketStream() = default;
+-inline SSLSocketStream::~SSLSocketStream() = default;
++inline SSLSocketStream::~SSLSocketStream() {
++  if (interrupt_) { set_nonblocking(sock_, false); }
++}
  
  inline bool SSLSocketStream::is_readable() const {
 -  return detail::select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0;
@@ -497,7 +673,58 @@ index 704d015..c713c01 100644
           is_socket_alive(sock_);
  }
  
-@@ -9326,7 +9482,8 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
+ inline ssize_t SSLSocketStream::read(char *ptr, size_t size) {
++  // ARN patch: non-blocking read loop (see the constructor). Every wait is
++  // interruptible and lasts at most the read timeout, as before. SSL_read()
++  // is always retried with the same arguments, as OpenSSL requires.
++  if (interrupt_) {
++    const auto len = static_cast<int>(
++        (std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
++    if (!SSL_has_pending(ssl_) && !is_readable()) { return -1; }
++    for (;;) {
++      const auto ret = SSL_read(ssl_, ptr, len);
++      if (ret > 0) { return ret; }
++      const auto err = SSL_get_error(ssl_, ret);
++      if (err == SSL_ERROR_WANT_READ) {
++        if (!is_readable()) { return -1; }
++      } else if (err == SSL_ERROR_WANT_WRITE) {
++        if (!is_writable()) { return -1; }
++      } else {
++        return ret;
++      }
++    }
++  }
++
+   if (SSL_pending(ssl_) > 0) {
+     return SSL_read(ssl_, ptr, static_cast<int>(size));
+   } else if (is_readable()) {
+@@ -9038,6 +9337,25 @@ inline ssize_t SSLSocketStream::read(char *ptr, size_t size) {
+ }
+ 
+ inline ssize_t SSLSocketStream::write(const char *ptr, size_t size) {
++  // ARN patch: non-blocking write loop (see the constructor).
++  if (interrupt_) {
++    if (!is_writable()) { return -1; }
++    const auto len = static_cast<int>(
++        (std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
++    for (;;) {
++      const auto ret = SSL_write(ssl_, ptr, len);
++      if (ret > 0) { return ret; }
++      const auto err = SSL_get_error(ssl_, ret);
++      if (err == SSL_ERROR_WANT_WRITE) {
++        if (!is_writable()) { return -1; }
++      } else if (err == SSL_ERROR_WANT_READ) {
++        if (!is_readable()) { return -1; }
++      } else {
++        return ret;
++      }
++    }
++  }
++
+   if (is_writable()) {
+     auto handle_size = static_cast<int>(
+         std::min<size_t>(size, (std::numeric_limits<int>::max)()));
+@@ -9326,7 +9644,8 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
    Response proxy_res;
    if (!detail::process_client_socket(
            socket.sock, read_timeout_sec_, read_timeout_usec_,
@@ -507,7 +734,7 @@ index 704d015..c713c01 100644
              Request req2;
              req2.method = "CONNECT";
              req2.path = host_and_port_;
-@@ -9349,7 +9506,8 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
+@@ -9349,7 +9668,8 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
          proxy_res = Response();
          if (!detail::process_client_socket(
                  socket.sock, read_timeout_sec_, read_timeout_usec_,
@@ -517,7 +744,7 @@ index 704d015..c713c01 100644
                    Request req3;
                    req3.method = "CONNECT";
                    req3.path = host_and_port_;
-@@ -9434,7 +9592,7 @@ inline bool SSLClient::initialize_ssl(Socket &socket, Error &error) {
+@@ -9434,7 +9754,7 @@ inline bool SSLClient::initialize_ssl(Socket &socket, Error &error) {
  
          if (!detail::ssl_connect_or_accept_nonblocking(
                  socket.sock, ssl2, SSL_connect, connection_timeout_sec_,
@@ -526,7 +753,7 @@ index 704d015..c713c01 100644
            error = Error::SSLConnection;
            return false;
          }
-@@ -9518,7 +9676,8 @@ SSLClient::process_socket(const Socket &socket,
+@@ -9518,7 +9838,8 @@ SSLClient::process_socket(const Socket &socket,
    assert(socket.ssl);
    return detail::process_client_socket_ssl(
        socket.ssl, socket.sock, read_timeout_sec_, read_timeout_usec_,

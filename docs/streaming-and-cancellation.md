@@ -168,4 +168,4 @@ worker.join();
 session.cancel_active_request();
 ```
 
-Inside the provider implementation, `cancel_active_request()` calls `client_->stop()` on the underlying `httplib::Client`, immediately terminating pending TCP socket reads or writes.
+Inside the provider implementation, `cancel_active_request()` calls `client_->stop()` on the underlying `httplib::Client`. That is a best-effort extra: on Windows `shutdown()` wakes neither a blocked `select()` nor a blocking `recv()`/`send()`. What ends a request reliably on every platform is the cancellation flag passed to the provider, which arn-core hands to httplib as `Request::interrupt`. With it, connecting, name lookup, the TLS handshake and every read and write (TLS records included) wait in 50 ms slices that check the flag, so a cancelled request ends within about one slice (see `third_party/cpp-httplib/README.md`).
